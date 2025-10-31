@@ -20,6 +20,8 @@ dist/
 .env
 .env.local
 .env.*.local
+# Keep .env.example tracked
+!.env.example
 
 # IDE
 .vscode/

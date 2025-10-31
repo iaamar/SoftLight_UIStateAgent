@@ -13,7 +13,7 @@ services:
     environment:
       - ENV_FILE=/app/.env
     env_file:
-      - ./.env.backend
+      - ./.env
     depends_on:
       - redis
     networks:
@@ -31,7 +31,7 @@ services:
     environment:
       - NODE_ENV=development
     env_file:
-      - ./.env.frontend
+      - ./.env
     depends_on:
       - backend
     networks:
@@ -49,7 +49,7 @@ services:
     environment:
       - ENV_FILE=/app/.env
     env_file:
-      - ./.env.mcp
+      - ./.env
     networks:
       - agent-b-network
 
