@@ -1,4 +1,4 @@
-# Agent B - UI State Capture Agent
+# SoftLight_UIStateAgent
 
 Production-grade, real-time UI state capture agent for a multi-agent AI system.
 
@@ -10,7 +10,7 @@ Production-grade, real-time UI state capture agent for a multi-agent AI system.
 - **Orchestration**: LangGraph DAG flows
 - **Browser Automation**: Playwright
 - **Context Sync**: MCP Server
-- **Memory**: Redis (optional)
+- **Memory**: Upstash (optional)
 
 ## Structure
 

@@ -14,8 +14,6 @@ services:
       - ENV_FILE=/app/.env
     env_file:
       - ./.env
-    depends_on:
-      - redis
     networks:
       - agent-b-network
 
@@ -52,19 +50,6 @@ services:
       - ./.env
     networks:
       - agent-b-network
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    networks:
-      - agent-b-network
-
-volumes:
-  redis-data:
-    driver: local
 
 networks:
   agent-b-network:
