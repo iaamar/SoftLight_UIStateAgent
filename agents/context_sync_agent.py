@@ -9,7 +9,7 @@ logger = get_logger(name="context_sync_agent")
 
 
 class ContextSyncAgent:
-    def __init__(self, llm_model: str = "gpt-4"):
+    def __init__(self, llm_model: str = "gpt-4o"):
         self.llm = self._get_llm(llm_model)
         self.upstash = UpstashSync()
         self.agent = Agent(
@@ -34,25 +34,25 @@ class ContextSyncAgent:
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
                 raise ValueError("OPENAI_API_KEY not found")
-            return ChatOpenAI(model=model, temperature=0.7, api_key=api_key)
+            # Remove temperature parameter entirely for compatibility
+            return ChatOpenAI(model=model, api_key=api_key)
     
     def save_context(self, key: str, context_data: Dict[str, Any], ttl: Optional[int] = None):
         logger.log_agent_start("ContextSyncAgent", task=f"Save context: {key}")
         
         try:
             import json
-            context_json = json.dumps(context_data)
+            context_json = json.dumps(context_data, default=str)  # Handle non-serializable types
             success = self.upstash.set(key, context_json, ttl=ttl)
             
             if success:
                 logger.log_agent_end("ContextSyncAgent", success=True)
             else:
-                logger.warning(f"Failed to save context: {key}")
+                logger.debug(f"Upstash save returned False for: {key}")  # Changed to debug level
             
             return success
         except Exception as e:
-            logger.log_error(e, context={"agent": "ContextSyncAgent", "action": "save"})
-            logger.log_agent_end("ContextSyncAgent", success=False)
+            logger.debug(f"Context sync skipped (Upstash unavailable): {str(e)[:100]}")  # Debug, not error
             return False
     
     def get_context(self, key: str) -> Optional[Dict[str, Any]]:

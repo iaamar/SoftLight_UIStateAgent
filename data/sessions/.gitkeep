@@ -1,0 +1,4 @@
+# Browser session files (contain login cookies - DO NOT COMMIT)
+data/sessions/*.json
+!data/sessions/.gitkeep
+

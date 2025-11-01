@@ -9,7 +9,7 @@ logger = get_logger(name="state_validator_agent")
 
 
 class StateValidatorAgent:
-    def __init__(self, browser: BrowserController, llm_model: str = "gpt-4"):
+    def __init__(self, browser: BrowserController, llm_model: str = "gpt-4o"):
         self.browser = browser
         self.llm = self._get_llm(llm_model)
         self.agent = Agent(
@@ -34,7 +34,8 @@ class StateValidatorAgent:
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
                 raise ValueError("OPENAI_API_KEY not found")
-            return ChatOpenAI(model=model, temperature=0.7, api_key=api_key)
+            # Remove temperature parameter entirely for compatibility
+            return ChatOpenAI(model=model, api_key=api_key)
     
     async def validate_state(self, expected_state: Optional[str] = None) -> Dict[str, Any]:
         logger.log_agent_start("StateValidatorAgent")

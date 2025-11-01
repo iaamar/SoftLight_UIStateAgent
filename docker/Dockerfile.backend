@@ -7,6 +7,11 @@ RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     ca-certificates \
+    xvfb \
+    x11vnc \
+    fluxbox \
+    novnc \
+    websockify \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -37,6 +42,9 @@ COPY . /app/
 
 ENV PYTHONPATH=/app
 
-EXPOSE 8000
+EXPOSE 8000 7900
 
-CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+COPY docker/entrypoint.backend.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+CMD ["/app/entrypoint.sh"]

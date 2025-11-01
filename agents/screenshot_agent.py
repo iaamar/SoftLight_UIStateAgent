@@ -9,7 +9,7 @@ logger = get_logger(name="screenshot_agent")
 
 
 class ScreenshotAgent:
-    def __init__(self, browser: BrowserController, llm_model: str = "gpt-4"):
+    def __init__(self, browser: BrowserController, llm_model: str = "gpt-4o"):
         self.browser = browser
         self.llm = self._get_llm(llm_model)
         self.agent = Agent(
@@ -34,7 +34,8 @@ class ScreenshotAgent:
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
                 raise ValueError("OPENAI_API_KEY not found")
-            return ChatOpenAI(model=model, temperature=0.7, api_key=api_key)
+            # Remove temperature parameter entirely for compatibility
+            return ChatOpenAI(model=model, api_key=api_key)
     
     async def capture_screenshot(self, app: str, task: str, step: int, context: Optional[str] = None) -> str:
         logger.log_agent_start("ScreenshotAgent", task=f"Step {step}")
