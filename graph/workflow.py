@@ -1,4 +1,4 @@
-from typing import TypedDict, List, Dict, Any, Optional
+from typing import TypedDict, List, Dict, Any, Optional, Callable, Awaitable
 from utils.logger import get_logger
 from utils.browser_controller import BrowserController
 from agents.ui_navigator_agent import UINavigatorAgent
@@ -22,6 +22,7 @@ class WorkflowState:
         self.navigation_steps: List[Dict[str, Any]] = []
         self.current_step: int = 0
         self.screenshots: List[str] = []
+        self.screenshot_to_step_map: Dict[str, int] = {}  # Map screenshot path to step index
         self.step_descriptions: List[str] = []
         self.ui_states: List[Dict[str, Any]] = []  # Comprehensive UI state captures
         self.state_valid: bool = True
@@ -36,16 +37,18 @@ class AgentWorkflow:
     def __init__(
         self,
         browser: BrowserController,
-        llm_model: str = "gpt-4o",
+        llm_model: str = "claude-sonnet-4-5-20250929",
         max_steps: int = 50,
         retry_attempts: int = 3,
-        capture_metadata: bool = True
+        capture_metadata: bool = True,
+        progress_callback: Optional[Callable[[int, int, str, Optional[str]], Awaitable[None]]] = None
     ):
         self.browser = browser
         self.llm_model = llm_model
         self.max_steps = max_steps
         self.retry_attempts = retry_attempts
         self.capture_metadata = capture_metadata
+        self.progress_callback = progress_callback
         
         self.navigator = UINavigatorAgent(browser, llm_model)
         self.screenshot = ScreenshotAgent(browser, llm_model)
@@ -103,12 +106,16 @@ class AgentWorkflow:
         try:
             if state.current_step == 0:
                 # Initial navigation planning
+                if self.progress_callback:
+                    await self.progress_callback(0, 0, "Planning navigation steps...", "analyzing")
                 navigation_steps = await self.navigator.navigate_to_task(
                     state.task_query,
                     state.app_url
                 )
                 state.navigation_steps = navigation_steps
                 logger.info(f"Generated {len(navigation_steps)} navigation steps")
+                if self.progress_callback:
+                    await self.progress_callback(0, len(navigation_steps), "Navigation plan created", "planning_complete")
                 
                 if len(navigation_steps) == 0:
                     logger.warning("No navigation steps generated - task may already be complete")
@@ -122,7 +129,7 @@ class AgentWorkflow:
             else:
                 logger.info(f"All navigation steps completed ({state.current_step}/{len(state.navigation_steps)})")
                 state.completed = True
-                
+            
         except Exception as e:
             logger.log_error(e, context={"step": "navigate", "step_number": state.current_step})
             self._log_execution(state, "navigation_error", {"error": str(e), "step": state.current_step})
@@ -141,6 +148,15 @@ class AgentWorkflow:
         description = step.get("description", "")
         
         logger.info(f"Executing step {state.current_step + 1}: {action_type} on '{selector}' - {description}")
+        
+        # Send progress update
+        if self.progress_callback:
+            await self.progress_callback(
+                state.current_step + 1,
+                len(state.navigation_steps),
+                description,
+                f"{action_type}: {description[:50]}"
+            )
         
         # Pre-execution state capture for modals/dynamic content
         if action_type == "click" and any(word in description.lower() for word in ["new", "create", "add", "open"]):
@@ -198,6 +214,30 @@ class AgentWorkflow:
         try:
             await self.browser.click(selector, retry=True)
             await self.browser.wait_for_stable_page()
+            
+            # Wait a bit for dropdowns/menus to appear after click
+            await asyncio.sleep(0.5)
+            
+            # Check if a dropdown/menu appeared (common after "create", "new", "add" buttons)
+            if any(word in description.lower() for word in ["create", "new", "add", "open", "show"]):
+                # Wait for potential dropdown/menu to appear
+                await asyncio.sleep(0.5)
+                # Check for visible menus/dropdowns
+                menu_selectors = [
+                    "[role='menu']:visible",
+                    "[role='listbox']:visible",
+                    ".dropdown-menu:visible",
+                    "[class*='menu']:visible",
+                    "[class*='dropdown']:visible",
+                ]
+                for menu_sel in menu_selectors:
+                    try:
+                        menu = await self.browser.page.query_selector(menu_sel)
+                        if menu:
+                            logger.info(f"Dropdown/menu detected after click: {menu_sel}")
+                            break
+                    except:
+                        continue
         except Exception as e:
             logger.warning(f"Standard click failed: {e}")
             
@@ -330,46 +370,71 @@ class AgentWorkflow:
         return None
     
     async def _screenshot_step_enhanced(self, state: WorkflowState):
-        """Enhanced screenshot with metadata and highlighting"""
+        """Smart screenshot with duplicate detection - always track steps, only capture unique screenshots"""
         logger.log_action("screenshot_step_enhanced", {"step": state.current_step})
         
         try:
-            # Determine what to highlight based on next step
-            highlight_elements = []
-            if state.current_step < len(state.navigation_steps):
-                next_step = state.navigation_steps[state.current_step]
-                if next_step.get("selector"):
-                    highlight_elements.append(next_step["selector"])
+            # Generate context description for smart cropping
+            context = await self._generate_step_description(state)
             
-            # Capture screenshot with highlights
-            screenshot_path = await self.browser.smart_screenshot(
+            # ALWAYS add step description (so all steps are visible to user)
+            # But only add screenshot if it's not a duplicate
+            state.step_descriptions.append(context)
+            
+            # Send progress update for screenshot capture
+            if self.progress_callback:
+                await self.progress_callback(
+                    state.current_step + 1,
+                    len(state.navigation_steps) if state.navigation_steps else 0,
+                    f"Capturing screenshot: {context[:50]}",
+                    "capturing_screenshot"
+                )
+            
+            # Use the smart screenshot agent (handles duplicate detection & cropping)
+            screenshot_path = await self.screenshot.capture_screenshot(
                 app=state.app_name,
                 task=state.task_name,
                 step=state.current_step,
-                full_page=True,
-                highlight_elements=highlight_elements
+                context=context,
+                force=False  # Allow duplicate detection
             )
             
-            state.screenshots.append(screenshot_path)
-            
-            # Generate comprehensive description
-            description = await self._generate_step_description(state)
-            state.step_descriptions.append(description)
-            
-            self._log_execution(state, "screenshot_captured", {
-                "path": screenshot_path,
-                "description": description,
-                "highlighted": len(highlight_elements) > 0
-            })
+            # Only add screenshot path if actually captured (not skipped as duplicate)
+            if screenshot_path:
+                state.screenshots.append(screenshot_path)
+                # Map screenshot to the step index it corresponds to
+                step_index = len(state.step_descriptions) - 1  # Current step description index
+                state.screenshot_to_step_map[screenshot_path] = step_index
+                self._log_execution(state, "screenshot_captured", {
+                    "path": screenshot_path,
+                    "description": context,
+                    "smart_cropped": True,
+                    "step": state.current_step,
+                    "step_index": step_index
+                })
+            else:
+                # Screenshot was skipped (duplicate) - but step description is already added
+                logger.info(f"⏭️ Screenshot skipped at step {state.current_step} - duplicate/identical state (step still tracked)")
+                self._log_execution(state, "screenshot_skipped", {
+                    "reason": "duplicate_state",
+                    "step": state.current_step,
+                    "description": context
+                })
             
         except Exception as e:
             logger.log_error(e, context={"step": "screenshot_enhanced"})
-            state.step_descriptions.append(f"Step {state.current_step} (screenshot failed)")
+            # Even on error, ensure step description is tracked
+            if len(state.step_descriptions) <= state.current_step:
+                try:
+                    context = await self._generate_step_description(state)
+                    state.step_descriptions.append(context)
+                except:
+                    state.step_descriptions.append(f"Step {state.current_step} (error: {str(e)[:50]})")
     
     async def _generate_step_description(self, state: WorkflowState) -> str:
-        """Generate detailed description for current step"""
+        """Generate user-friendly step description in simple, guide-like language"""
         if state.current_step == 0:
-            return f"Initial state: {state.app_url}"
+            return f"Start: Open the application"
         
         # Get info about what just happened
         if state.current_step > 0 and state.current_step <= len(state.navigation_steps):
@@ -377,20 +442,132 @@ class AgentWorkflow:
             action = prev_step.get("action_type", "")
             desc = prev_step.get("description", "")
             
-            # Check for modals
+            # Simplify descriptions for user guidance
+            simplified = self._simplify_description(action, desc)
+            
+            # Only include modal info if it's a NEW modal (not repeating the same one)
             modal_info = ""
-            if state.detected_modals:
-                modal_info = f" (Modal detected: {state.detected_modals[-1].get('text', '')[:50]}...)"
+            if state.detected_modals and len(state.detected_modals) > 0:
+                latest_modal = state.detected_modals[-1]
+                modal_text = latest_modal.get('text', '')[:50]
+                
+                # Check if this modal was already mentioned in recent step descriptions
+                already_mentioned = False
+                if len(state.step_descriptions) > 0:
+                    last_3_descriptions = state.step_descriptions[-3:]
+                    for prev_desc in last_3_descriptions:
+                        if modal_text and modal_text in prev_desc:
+                            already_mentioned = True
+                            break
+                
+                if not already_mentioned and modal_text:
+                    # Simplify modal info
+                    modal_info = f" (A popup or menu appeared)"
             
             # Check for forms
             form_info = ""
             if state.form_interactions:
                 last_form = state.form_interactions[-1]
-                form_info = f" (Filled: {last_form['description']})"
+                form_info = f" (Entered information)"
             
-            return f"After {action}: {desc}{modal_info}{form_info}"
+            return f"{simplified}{modal_info}{form_info}"
         
-        return f"State at step {state.current_step}"
+        return f"Step {state.current_step}"
+    
+    def _simplify_description(self, action: str, description: str) -> str:
+        """Simplify step descriptions to be more user-friendly and guide-like"""
+        desc_lower = description.lower()
+        
+        # Common patterns to simplify
+        if action == "click":
+            # Extract what was clicked
+            if "code" in desc_lower and "button" in desc_lower:
+                return "Click the 'Code' button"
+            elif "clone" in desc_lower and "url" in desc_lower:
+                return "Copy the clone URL"
+            elif "copy" in desc_lower and "button" in desc_lower:
+                return "Click the 'Copy' button"
+            elif "https" in desc_lower:
+                return "Select the HTTPS option"
+            elif "clone" in desc_lower:
+                return "Click on the clone option"
+            else:
+                # Try to extract quoted text or simplify
+                import re
+                quoted = re.search(r'[\'"]([^\'"]+)[\'"]', description)
+                if quoted:
+                    return f"Click on '{quoted.group(1)}'"
+                # Simplify generic click descriptions
+                desc_simple = description.replace("Click", "Click on").replace("click", "Click on")
+                return desc_simple[:60] if len(desc_simple) > 60 else desc_simple
+        
+        elif action == "wait":
+            if "dropdown" in desc_lower or "menu" in desc_lower:
+                return "Wait for the menu to appear"
+            elif "dynamic" in desc_lower or "content" in desc_lower:
+                return "Wait for the page to load"
+            elif "appear" in desc_lower:
+                return "Wait for the element to appear"
+            else:
+                return "Wait a moment"
+        
+        elif action == "type":
+            # Extract what was typed
+            import re
+            text_match = re.search(r"type\s+(?:text|value|input)[\s:]*['\"]?([^'\"]+)['\"]?", desc_lower)
+            if text_match:
+                typed_text = text_match.group(1)[:30]
+                return f"Type '{typed_text}'"
+            elif "enter" in desc_lower or "text" in desc_lower:
+                return "Enter text"
+            else:
+                return "Enter text"
+        
+        elif action == "select":
+            return "Select an option"
+        
+        elif action == "hover":
+            return "Hover over the element"
+        
+        elif action == "scroll":
+            return "Scroll to view more content"
+        
+        # Fallback: return simplified version
+        simplified = description.replace("After ", "").replace("after ", "")
+        if len(simplified) > 80:
+            simplified = simplified[:77] + "..."
+        return simplified
+    
+    def _remove_duplicate_steps(self, step_descriptions: List[str]) -> List[str]:
+        """Remove consecutive duplicate step descriptions"""
+        if not step_descriptions:
+            return []
+        
+        filtered = [step_descriptions[0]]  # Always keep first step
+        
+        for i in range(1, len(step_descriptions)):
+            current = step_descriptions[i].strip()
+            previous = step_descriptions[i-1].strip()
+            
+            # Remove common prefixes/suffixes for comparison
+            current_normalized = current.lower().replace(" (a popup or menu appeared)", "").replace(" (entered information)", "").strip()
+            previous_normalized = previous.lower().replace(" (a popup or menu appeared)", "").replace(" (entered information)", "").strip()
+            
+            # Skip if it's identical or very similar
+            if current_normalized != previous_normalized:
+                # Check if it's a near-duplicate using word similarity
+                current_words = set(current_normalized.split())
+                previous_words = set(previous_normalized.split())
+                if len(current_words) > 0 and len(previous_words) > 0:
+                    similarity = len(current_words & previous_words) / len(current_words | previous_words)
+                    if similarity < 0.7:  # Less than 70% similar - keep it
+                        filtered.append(step_descriptions[i])
+                    # else skip - too similar (likely duplicate)
+                else:
+                    filtered.append(step_descriptions[i])
+            # else skip - identical
+        
+        return filtered
     
     async def _save_workflow_metadata(self, state: WorkflowState):
         """Save detailed metadata about the workflow execution"""
@@ -406,7 +583,7 @@ class AgentWorkflow:
             "error": state.error,
             "total_steps": len(state.navigation_steps),
             "steps_completed": state.current_step,
-            "screenshots": state.screenshots,
+                "screenshots": state.screenshots,
             "step_descriptions": state.step_descriptions,
             "execution_time": state.execution_log[-1]["timestamp"] - state.execution_log[0]["timestamp"] if state.execution_log else 0,
             "detected_modals": len(state.detected_modals),
@@ -472,10 +649,24 @@ class AgentWorkflow:
             # Save comprehensive metadata
             await self._save_workflow_metadata(state)
             
+            # Filter out duplicate consecutive step descriptions
+            filtered_descriptions = self._remove_duplicate_steps(state.step_descriptions)
+            
+            # Create screenshot metadata with step mappings
+            screenshot_metadata = []
+            for screenshot in state.screenshots:
+                step_index = state.screenshot_to_step_map.get(screenshot, -1)
+                screenshot_metadata.append({
+                    "path": screenshot,
+                    "step_index": step_index,
+                    "step_number": step_index + 1 if step_index >= 0 else None
+                })
+            
             result = {
                 "success": state.completed and not state.error,
                 "screenshots": state.screenshots,
-                "step_descriptions": state.step_descriptions,
+                "screenshot_metadata": screenshot_metadata,  # Include mapping info
+                "step_descriptions": filtered_descriptions,
                 "steps_completed": state.current_step,
                 "error": state.error,
                 "final_url": await self.browser.get_url(),

@@ -9,7 +9,7 @@ logger = get_logger(name="context_sync_agent")
 
 
 class ContextSyncAgent:
-    def __init__(self, llm_model: str = "gpt-4o"):
+    def __init__(self, llm_model: str = "claude-sonnet-4-5-20250929"):
         self.llm = self._get_llm(llm_model)
         self.upstash = UpstashSync()
         self.agent = Agent(

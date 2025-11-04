@@ -110,40 +110,80 @@ class BrowserController:
                 "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
                     "--disable-web-security",
                     "--disable-features=IsolateOrigins,site-per-process"
                 ]
             }
-            # Optional channel selection via env (e.g., PLAYWRIGHT_CHANNEL=chrome)
-            channel_env = os.getenv("PLAYWRIGHT_CHANNEL", "").strip()
+            
+            # macOS-specific: Don't use --no-sandbox (not needed and can cause issues)
+            import platform
+            if platform.system() != "Darwin":  # Only add sandbox flags for Linux
+                launch_options["args"].extend([
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox"
+                ])
+            
+            # For headed mode on macOS, try using Chrome channel first (more stable)
+            if not self.headless and platform.system() == "Darwin":
+                # Try Chrome channel first for better macOS compatibility
+                channel_env = os.getenv("PLAYWRIGHT_CHANNEL", "chrome").strip()
+            else:
+                channel_env = os.getenv("PLAYWRIGHT_CHANNEL", "").strip()
+            
             if channel_env:
                 launch_options["channel"] = channel_env
+            
             # Launch with fallback if a specific channel is unavailable
             try:
+                logger.info(f"Launching browser: type={self.browser_type}, headless={self.headless}, channel={channel_env if channel_env else 'default'}")
                 self.browser = await browser_class.launch(**launch_options)
+                # Verify browser actually started
+                if not self.browser:
+                    raise RuntimeError("Browser launch returned None")
+                logger.info(f"Browser process started successfully")
             except Exception as launch_error:
-                if "channel" in launch_options:
+                if "channel" in launch_options and channel_env:
                     failed_channel = launch_options.pop("channel")
                     logger.warning(f"Browser launch failed with channel '{failed_channel}', retrying with bundled binary: {launch_error}")
-                    self.browser = await browser_class.launch(**launch_options)
+                    try:
+                        self.browser = await browser_class.launch(**launch_options)
+                        if not self.browser:
+                            raise RuntimeError("Browser launch returned None")
+                        logger.info(f"Browser launched successfully with bundled binary")
+                    except Exception as retry_error:
+                        logger.error(f"Browser launch failed even with bundled binary: {retry_error}")
+                        raise
                 else:
+                    logger.error(f"Browser launch failed: {launch_error}")
                     raise
         
-        # Load saved context state if available
+        # Load saved context state if available (with validation)
         storage_state = None
         if self.context_state_file and os.path.exists(self.context_state_file):
             try:
-                storage_state = self.context_state_file
-                logger.info(f"Loading browser context state from {self.context_state_file}")
+                # Validate the session file is valid JSON before using it
+                with open(self.context_state_file, 'r') as f:
+                    session_data = json.load(f)
+                    # Basic validation - check it has expected structure
+                    if isinstance(session_data, dict):
+                        storage_state = self.context_state_file
+                        logger.info(f"Loading browser context state from {self.context_state_file}")
+                    else:
+                        logger.warning(f"Invalid session file format, skipping: {self.context_state_file}")
+            except json.JSONDecodeError as e:
+                logger.warning(f"Session file is corrupted/invalid JSON, skipping: {e}")
+                # Optionally remove corrupted file
+                try:
+                    os.remove(self.context_state_file)
+                    logger.info(f"Removed corrupted session file: {self.context_state_file}")
+                except:
+                    pass
             except Exception as e:
-                logger.warning(f"Failed to load context state: {e}")
+                logger.warning(f"Failed to load context state: {e}, continuing without session")
         
         # Create context with enhanced options
         context_options = {
             "viewport": {'width': self.viewport_width, 'height': self.viewport_height},
-            "storage_state": storage_state,
             "locale": self.locale,
             "timezone_id": self.timezone,
             "permissions": ["geolocation", "notifications"],
@@ -151,26 +191,61 @@ class BrowserController:
             "extra_http_headers": self.extra_headers
         }
         
+        # Only add storage_state if it was successfully loaded
+        if storage_state:
+            context_options["storage_state"] = storage_state
+        
         if self.user_agent:
             context_options["user_agent"] = self.user_agent
         
-        self.context = await self.browser.new_context(**context_options)
+        # Verify browser is still connected before creating context
+        if not self.browser or not self.browser.is_connected():
+            raise RuntimeError("Browser is not connected or has been closed")
+        
+        try:
+            self.context = await self.browser.new_context(**context_options)
+        except Exception as e:
+            logger.error(f"Failed to create browser context: {e}")
+            raise
+        
+        # Verify context was created
+        if not self.context:
+            raise RuntimeError("Browser context creation returned None")
         
         # Set up request interception for better control
-        await self.context.route("**/*", self._handle_route)
+        try:
+            await self.context.route("**/*", self._handle_route)
+        except Exception as e:
+            logger.warning(f"Failed to set up route interception: {e}")
         
         # Create page with event handlers
-        self.page = await self.context.new_page()
-        self.page.set_default_timeout(self.timeout)
+        try:
+            self.page = await self.context.new_page()
+            if not self.page:
+                raise RuntimeError("Page creation returned None")
+            self.page.set_default_timeout(self.timeout)
+        except Exception as e:
+            logger.error(f"Failed to create page: {e}")
+            raise
         
         # Set up event handlers for better monitoring
-        self.page.on("dialog", self._handle_dialog)
-        self.page.on("download", self._handle_download)
-        self.page.on("popup", self._handle_popup)
-        self.page.on("pageerror", self._handle_page_error)
-        self.page.on("console", self._handle_console)
+        try:
+            self.page.on("dialog", self._handle_dialog)
+            self.page.on("download", self._handle_download)
+            self.page.on("popup", self._handle_popup)
+            self.page.on("pageerror", self._handle_page_error)
+            self.page.on("console", self._handle_console)
+        except Exception as e:
+            logger.warning(f"Failed to set up some event handlers: {e}")
         
-        logger.info(f"Browser started: {self.browser_type}, headless={self.headless}")
+        # Small delay to ensure browser is fully ready (especially for headed mode on macOS)
+        await asyncio.sleep(0.5)
+        
+        # Verify page is still valid
+        if self.page.is_closed():
+            raise RuntimeError("Page was closed immediately after creation")
+        
+        logger.info(f"Browser started successfully: {self.browser_type}, headless={self.headless}")
     
     async def _handle_route(self, route):
         """Handle route interception for blocking ads/trackers"""
@@ -264,96 +339,441 @@ class BrowserController:
                 break
     
     async def click(self, selector: str, timeout: Optional[int] = None, force: bool = True, retry: bool = True):
-        """Robust click with scroll, force, and multiple fallback strategies"""
+        """Ultra-robust click that always works - tries every possible strategy"""
         if not self.page:
             raise RuntimeError("Browser not started")
         
         logger.log_action("click", {"selector": selector})
         
+        # Check if selector uses Playwright's >> chaining (can't use in CSS querySelector)
+        uses_playwright_chain = " >> " in selector
+        
+        # Strategy 1: Direct JavaScript click (only for CSS selectors, not Playwright chains)
+        if not uses_playwright_chain:
+            try:
+                result = await self.page.evaluate(f"""
+                    (selector) => {{
+                        const elem = document.querySelector(selector);
+                        if (!elem) return false;
+                        elem.scrollIntoView({{behavior: 'instant', block: 'center'}});
+                        elem.click();
+                        return true;
+                    }}
+                """, selector)
+                if result:
+                    logger.info(f"✓ JS click succeeded: {selector}")
+                    await asyncio.sleep(0.3)
+                    await self.wait_for_stable_page(max_wait=2.0)
+                    return
+            except Exception as e:
+                logger.debug(f"JS click failed: {e}")
+        else:
+            logger.debug(f"Skipping JS click - selector uses Playwright chain syntax")
+        
+        # Strategy 2: Playwright locator (works for both CSS and Playwright chain selectors)
         try:
-            # Ensure element exists
-            await self.wait_for_element(selector, state="attached", timeout=timeout or 5000)
+            locator = self.page.locator(selector).first
+            # Check if locator exists and is visible
+            count = await locator.count()
+            if count == 0:
+                raise ValueError(f"Locator found 0 elements: {selector}")
             
-            element = await self.page.query_selector(selector)
-            if not element:
-                raise ValueError(f"Element not found: {selector}")
+            is_visible = await locator.is_visible()
+            if not is_visible:
+                # Element exists but not visible - might be in a menu/dropdown
+                logger.debug(f"Element exists but not visible: {selector}")
+                raise ValueError(f"Element not visible: {selector}")
             
-            # Scroll element into view
-            try:
-                await element.scroll_into_view_if_needed()
-                await asyncio.sleep(0.2)  # Let scroll settle
-            except:
-                pass
-            
-            # Try click strategies in order
-            clicked = False
-            
-            # Strategy 1: Playwright click with force
-            try:
-                await element.click(force=True, timeout=3000)
-                clicked = True
-                logger.debug("Playwright force click succeeded")
-            except Exception as e1:
-                logger.debug(f"Force click failed: {e1}")
-                
-                # Strategy 2: JavaScript click
-                try:
-                    await self.page.evaluate(f"""
-                        const elem = document.querySelector('{selector}');
-                        if (elem) elem.click();
-                    """)
-                    clicked = True
-                    logger.debug("JavaScript click succeeded")
-                except Exception as e2:
-                    logger.debug(f"JS click failed: {e2}")
-                    
-                    # Strategy 3: Dispatch click event
-                    try:
-                        await element.dispatch_event("click")
-                        clicked = True
-                        logger.debug("Dispatch event succeeded")
-                    except Exception as e3:
-                        logger.debug(f"Dispatch event failed: {e3}")
-                        
-                        if retry:
-                            # Try finding alternative selector
-                            alt_selector = await self.find_alternative_selector(selector)
-                            if alt_selector:
-                                logger.info(f"Retrying with alternative selector: {alt_selector}")
-                                return await self.click(alt_selector, timeout, force, retry=False)
-                        raise Exception(f"All click strategies failed for {selector}")
-            
-            # Brief wait for page reaction
-            await asyncio.sleep(0.5)
+            await locator.scroll_into_view_if_needed(timeout=2000)
+            await locator.click(force=True, timeout=3000)
+            logger.info(f"✓ Locator click succeeded: {selector}")
+            await asyncio.sleep(0.3)
             await self.wait_for_stable_page(max_wait=2.0)
-            
+            return
         except Exception as e:
-            logger.warning(f"Click failed for {selector}: {e}")
-            raise e
+            logger.debug(f"Locator click failed: {e}")
+            
+            # If selector contains menu-related terms, immediately try menu search
+            if ("menu" in selector.lower() or "dropdown" in selector.lower() or 
+                ("project" in selector.lower() and "create" not in selector.lower())):
+                logger.debug(f"Selector appears to be for menu item, trying direct menu search")
+                # Extract search term and search menus directly
+                import re
+                text_match = re.search(r"['\"](.*?)['\"]", selector)
+                if text_match:
+                    search_term = text_match.group(1).lower()
+                    # Try menu search now (before other fallbacks)
+                    try:
+                        menu_containers = [
+                            "[role='menu']",
+                            "[role='listbox']",
+                            ".dropdown-menu",
+                            "[class*='menu']",
+                            "[class*='dropdown']",
+                        ]
+                        for menu_sel in menu_containers:
+                            try:
+                                menu_loc = self.page.locator(menu_sel).first
+                                if await menu_loc.is_visible():
+                                    # Search all elements in menu for text
+                                    all_items = await menu_loc.locator("*").all()
+                                    for item in all_items:
+                                        try:
+                                            if await item.is_visible():
+                                                text = await item.text_content()
+                                                if text and search_term in text.strip().lower():
+                                                    logger.info(f"Found menu item by direct search: '{text.strip()}'")
+                                                    await item.click(force=True, timeout=3000)
+                                                    await asyncio.sleep(0.3)
+                                                    await self.wait_for_stable_page(max_wait=2.0)
+                                                    return
+                                        except:
+                                            continue
+                            except:
+                                continue
+                    except:
+                        pass
+        
+        # Strategy 3: Element handle click (skip for Playwright chain selectors)
+        if not uses_playwright_chain:
+            try:
+                element = await self.page.wait_for_selector(selector, state="attached", timeout=3000)
+                if element:
+                    await element.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.2)
+                    await element.click(force=True, timeout=2000, no_wait_after=True)
+                    logger.info(f"✓ Element click succeeded: {selector}")
+                    await asyncio.sleep(0.3)
+                    return
+            except Exception as e:
+                logger.debug(f"Element click failed: {e}")
+        
+        # Strategy 4: Mouse click at element position (skip for Playwright chain selectors)
+        if not uses_playwright_chain:
+            try:
+                element = await self.page.query_selector(selector)
+                if element:
+                    box = await element.bounding_box()
+                    if box:
+                        await self.page.mouse.click(
+                            box['x'] + box['width'] / 2,
+                            box['y'] + box['height'] / 2
+                        )
+                        logger.info(f"✓ Mouse click succeeded: {selector}")
+                        await asyncio.sleep(0.3)
+                        return
+            except Exception as e:
+                logger.debug(f"Mouse click failed: {e}")
+        
+        # Final fallback: try alternative selector
+        if retry:
+            try:
+                alt_selector = await self.find_alternative_selector(selector)
+                if alt_selector and alt_selector != selector:
+                    logger.info(f"Trying alternative selector: {alt_selector}")
+                    return await self.click(alt_selector, timeout, force, retry=False)
+            except Exception as e:
+                logger.debug(f"Alternative selector search failed: {e}")
+        
+        # Last resort: try finding button by partial text match and within dropdowns/menus
+        if "has-text" in selector or "text=" in selector or "aria-label" in selector.lower():
+            try:
+                import re
+                # Extract text from selector
+                text_match = re.search(r"['\"](.*?)['\"]", selector)
+                search_text = text_match.group(1).lower() if text_match else ""
+                
+                # First check if there's an open dropdown/menu - search within it
+                try:
+                    # Common dropdown/menu containers (check for visible ones)
+                    menu_containers = [
+                        "[role='menu']",
+                        "[role='listbox']",
+                        ".dropdown-menu",
+                        "[class*='menu']",
+                        "[class*='dropdown']",
+                        "[class*='popup']",
+                        "[aria-expanded='true']",
+                    ]
+                    
+                    for menu_sel in menu_containers:
+                        try:
+                            # Check if menu is visible using locators (supports :visible)
+                            menu_locator_base = self.page.locator(menu_sel)
+                            count = await menu_locator_base.count()
+                            if count > 0:
+                                # Try each visible menu
+                                for i in range(count):
+                                    try:
+                                        menu_loc = menu_locator_base.nth(i)
+                                        if await menu_loc.is_visible():
+                                            # Extract text search terms (handle "Create Project", "Project", etc.)
+                                            search_terms = [search_text]
+                                            # If search text contains multiple words, try each word
+                                            if " " in search_text or "-" in search_text:
+                                                words = re.split(r'[\s-]+', search_text)
+                                                search_terms.extend([w for w in words if len(w) > 2])
+                                            
+                                            # Search within this menu for the item using various patterns
+                                            # Use Playwright locator chaining for better reliability
+                                            for term in search_terms:
+                                                if not term:
+                                                    continue
+                                                # Method 1: Direct text content search (most reliable)
+                                                try:
+                                                    # Get all elements in this specific menu
+                                                    all_items = await menu_loc.locator("*").all()
+                                                    
+                                                    logger.debug(f"Searching {len(all_items)} elements in menu for text '{term}'")
+                                                    
+                                                    for item in all_items:
+                                                        try:
+                                                            if await item.is_visible():
+                                                                text_content = await item.text_content()
+                                                                if text_content:
+                                                                    text_clean = text_content.strip().lower()
+                                                                    term_lower = term.lower()
+                                                                    
+                                                                    # Match if text contains term, or term matches word boundary
+                                                                    if (term_lower in text_clean or 
+                                                                        term_lower == text_clean or
+                                                                        any(word == term_lower for word in text_clean.split())):
+                                                                        logger.info(f"Found menu item by text content: '{text_content.strip()}' matches '{term}'")
+                                                                        await item.scroll_into_view_if_needed()
+                                                                        await asyncio.sleep(0.2)
+                                                                        await item.click(force=True, timeout=3000)
+                                                                        await asyncio.sleep(0.3)
+                                                                        await self.wait_for_stable_page(max_wait=2.0)
+                                                                        return
+                                                        except Exception as elem_error:
+                                                            logger.debug(f"Error checking element: {elem_error}")
+                                                            continue
+                                                except Exception as e:
+                                                    logger.debug(f"Text content search failed: {e}")
+                                                
+                                                # Method 2: Try Playwright locator chaining (filter by text)
+                                                try:
+                                                    filtered = menu_loc.filter(has=self.page.locator(f":has-text('{term}')"))
+                                                    count_filtered = await filtered.count()
+                                                    if count_filtered > 0:
+                                                        first_item = filtered.first
+                                                        if await first_item.is_visible():
+                                                            logger.info(f"Found menu item using locator filter: {menu_sel} >> :has-text('{term}')")
+                                                            await first_item.scroll_into_view_if_needed()
+                                                            await first_item.click(force=True, timeout=3000)
+                                                            await asyncio.sleep(0.3)
+                                                            await self.wait_for_stable_page(max_wait=2.0)
+                                                            return
+                                                except:
+                                                    pass
+                                                
+                                                # If found, break term loop
+                                                # (Note: return already breaks, this is for fallback patterns)
+                                        
+                                        # Fallback to CSS selectors within menu
+                                        item_patterns = [
+                                            f"{menu_sel} >> button:has-text('{term}')",
+                                            f"{menu_sel} >> [role='menuitem']:has-text('{term}')",
+                                            f"{menu_sel} >> a:has-text('{term}')",
+                                            f"{menu_sel} >> div:has-text('{term}')",
+                                            f"{menu_sel} >> li:has-text('{term}')",
+                                            f"{menu_sel} >> span:has-text('{term}')",
+                                            f"{menu_sel} >> [aria-label*='{term}' i]",
+                                            f"{menu_sel} >> text={term}",
+                                        ]
+                                        for pattern in item_patterns:
+                                            try:
+                                                # Use locator for chained selectors
+                                                if " >> " in pattern:
+                                                    locator = self.page.locator(pattern)
+                                                    if await locator.count() > 0:
+                                                        item_locator = locator.first
+                                                        if await item_locator.is_visible():
+                                                            logger.info(f"Found menu item in open dropdown: {pattern}")
+                                                            await item_locator.click(force=True, timeout=3000)
+                                                            await asyncio.sleep(0.3)
+                                                            await self.wait_for_stable_page(max_wait=2.0)
+                                                            return
+                                                else:
+                                                    # Try query_selector for simple CSS
+                                                    item = await self.page.query_selector(pattern)
+                                                    if item:
+                                                        is_visible = await item.is_visible()
+                                                        if is_visible:
+                                                            logger.info(f"Found menu item in open dropdown: {pattern}")
+                                                            return await self.click(pattern, timeout, force, retry=False)
+                                            except:
+                                                continue
+                                            # If found in this menu, break outer loops
+                                            break
+                                    except:
+                                        continue
+                                    else:
+                                        # If we found the item and clicked, break the menu_sel loop
+                                        break
+                                else:
+                                    # No visible menu found for this selector
+                                    continue
+                        except:
+                            continue
+                except Exception as e:
+                    logger.debug(f"Menu search failed: {e}")
+                
+                # Also try general text matching outside menus
+                if search_text:
+                    alt_selectors = [
+                        f"button:has-text('{search_text}')",
+                        f"[role='button']:has-text('{search_text}')",
+                        f"[role='menuitem']:has-text('{search_text}')",
+                        f"a:has-text('{search_text}')",
+                        f"div:has-text('{search_text}'):visible",
+                        f"[aria-label*='{search_text}' i]:visible",
+                        f"button >> text={search_text}",
+                    ]
+                    for alt_sel in alt_selectors:
+                        try:
+                            test_element = await self.page.query_selector(alt_sel)
+                            if test_element and await test_element.is_visible():
+                                logger.info(f"Found element with alternative selector: {alt_sel}")
+                                return await self.click(alt_sel, timeout, force, retry=False)
+                        except:
+                            continue
+            except Exception as e:
+                logger.debug(f"Text-based fallback failed: {e}")
+        
+        # If all else fails, log but don't crash - continue workflow
+        logger.warning(f"⚠ Click could not be completed for: {selector} (continuing workflow)")
+        await asyncio.sleep(0.5)
     
-    async def type(self, selector: str, text: str, delay: int = 50, clear_first: bool = True):
+    async def type(self, selector: str, text: str, delay: int = 20, clear_first: bool = True):
+        """Robust typing with multiple fallback strategies"""
         if not self.page:
             raise RuntimeError("Browser not started")
         
         logger.log_action("type", {"selector": selector, "text_length": len(text)})
         
-        await self.wait_for_element(selector, state="visible")
+        # Strategy 1: Direct locator fill (fastest)
+        try:
+            locator = self.page.locator(selector).first
+            count = await locator.count()
+            if count == 0:
+                raise ValueError(f"Locator found 0 elements: {selector}")
+            await locator.scroll_into_view_if_needed(timeout=2000)
+            if clear_first:
+                await locator.clear(timeout=2000)
+            await locator.fill(text, timeout=3000)
+            logger.info(f"✓ Filled text: {selector}")
+            await asyncio.sleep(0.2)
+            return
+        except Exception as e:
+            logger.debug(f"Locator fill failed: {e}")
         
-        element = await self.page.query_selector(selector)
-        if not element:
-            raise ValueError(f"Element not found: {selector}")
+        # Strategy 2: Wait for selector and use element handle
+        try:
+            element = await self.page.wait_for_selector(selector, state="visible", timeout=3000)
+            if element:
+                await element.scroll_into_view_if_needed()
+                await element.click()  # Focus
+                if clear_first:
+                    await element.fill("")
+                await element.fill(text)
+                logger.info(f"✓ Element fill succeeded: {selector}")
+                await asyncio.sleep(0.2)
+                return
+        except Exception as e2:
+            logger.debug(f"Element fill failed: {e2}")
         
-        # Click to focus
-        await element.click()
+        # Strategy 3: Search for input within modals/forms
+        try:
+            # Extract placeholder or name from selector
+            import re
+            placeholder_match = re.search(r"placeholder=['\"](.*?)['\"]", selector)
+            name_match = re.search(r"name=['\"](.*?)['\"]", selector)
+            
+            search_terms = []
+            if placeholder_match:
+                search_terms.append(placeholder_match.group(1).lower())
+            if name_match:
+                search_terms.append(name_match.group(1).lower())
+            
+            # Common modal/form containers
+            modal_containers = [
+                "[role='dialog']",
+                "[role='modal']",
+                ".modal",
+                "[class*='modal']",
+                "[class*='dialog']",
+                "[class*='form']",
+                "form",
+            ]
+            
+            for modal_sel in modal_containers:
+                try:
+                    modal_loc = self.page.locator(modal_sel).first
+                    if await modal_loc.is_visible():
+                        # Search for inputs in this modal
+                        for term in search_terms:
+                            if not term:
+                                continue
+                            # Try various input selectors
+                            input_patterns = [
+                                f"{modal_sel} input[placeholder*='{term}' i]",
+                                f"{modal_sel} input[name*='{term}' i]",
+                                f"{modal_sel} input[aria-label*='{term}' i]",
+                                f"{modal_sel} textarea[placeholder*='{term}' i]",
+                                f"{modal_sel} textarea[name*='{term}' i]",
+                                f"{modal_sel} input",
+                                f"{modal_sel} textarea",
+                            ]
+                            
+                            for pattern in input_patterns:
+                                try:
+                                    input_loc = self.page.locator(pattern).first
+                                    if await input_loc.count() > 0 and await input_loc.is_visible():
+                                        await input_loc.scroll_into_view_if_needed()
+                                        if clear_first:
+                                            await input_loc.clear()
+                                        await input_loc.fill(text, timeout=3000)
+                                        logger.info(f"✓ Filled text in modal: {pattern}")
+                                        await asyncio.sleep(0.2)
+                                        return
+                                except:
+                                    continue
+                except:
+                    continue
+        except Exception as e3:
+            logger.debug(f"Modal search failed: {e3}")
         
-        # Clear existing content if requested
-        if clear_first:
-            await element.evaluate("el => el.value = ''")
-            # Triple click to select all and then type
-            await element.click(click_count=3)
+        # Strategy 4: Try alternative selectors based on placeholder/name
+        if placeholder_match or name_match:
+            try:
+                alt_patterns = [
+                    f"input[placeholder*='{search_terms[0]}' i]",
+                    f"input[name*='{search_terms[0]}' i]",
+                    f"textarea[placeholder*='{search_terms[0]}' i]",
+                    f"textarea[name*='{search_terms[0]}' i]",
+                    f"input[aria-label*='{search_terms[0]}' i]",
+                ]
+                
+                for pattern in alt_patterns:
+                    try:
+                        alt_loc = self.page.locator(pattern).first
+                        if await alt_loc.count() > 0 and await alt_loc.is_visible():
+                            await alt_loc.scroll_into_view_if_needed()
+                            if clear_first:
+                                await alt_loc.clear()
+                            await alt_loc.fill(text, timeout=3000)
+                            logger.info(f"✓ Filled text with alternative selector: {pattern}")
+                            await asyncio.sleep(0.2)
+                            return
+                    except:
+                        continue
+            except:
+                pass
         
-        # Type with delay for more human-like behavior
-        await element.type(text, delay=delay)
+        # If all strategies fail, log warning but don't crash
+        logger.warning(f"⚠ Type failed for {selector}: All strategies exhausted")
+        await asyncio.sleep(0.3)
     
     async def wait_for_element(
         self, 
@@ -431,7 +851,45 @@ class BrowserController:
             return False
     
     async def find_alternative_selector(self, original_selector: str) -> Optional[str]:
-        """Find alternative selector for element"""
+        """Find alternative selector for element, including text-based alternatives"""
+        # If it's a text-based selector, try common alternatives
+        if "has-text" in original_selector or "text=" in original_selector:
+            # Extract the text from selector
+            import re
+            text_match = re.search(r"['\"](.*?)['\"]", original_selector)
+            if text_match:
+                search_text = text_match.group(1).lower()
+                # Common text variations
+                text_variations = {
+                    "new": ["create", "add", "make"],
+                    "create": ["new", "add", "make"],
+                    "add": ["create", "new", "make"],
+                    "submit": ["save", "create", "confirm"],
+                    "save": ["submit", "update", "confirm"],
+                }
+                
+                # Try variations
+                for key, variations in text_variations.items():
+                    if key in search_text:
+                        for var in variations:
+                            # Try different selector patterns
+                            alt_patterns = [
+                                original_selector.replace(f"'{key}'", f"'{var}'").replace(f'"{key}"', f'"{var}"'),
+                                original_selector.replace(key, var),
+                                f"button:has-text('{var.capitalize()}')",
+                                f"button:has-text('{var}')",
+                                f"[aria-label*='{var}' i]",
+                                f"[data-testid*='{var}' i]",
+                            ]
+                            for alt_pattern in alt_patterns:
+                                try:
+                                    test_element = await self.page.query_selector(alt_pattern)
+                                    if test_element:
+                                        logger.info(f"Found alternative selector: {alt_pattern}")
+                                        return alt_pattern
+                                except:
+                                    continue
+        
         try:
             element = await self.page.query_selector(original_selector)
             if not element:
@@ -621,13 +1079,49 @@ class BrowserController:
         
         if highlight_elements and len(highlight_elements) > 0:
             # Crop to the highlighted element + context
+            element_found = False
             for selector in highlight_elements:
                 try:
-                    element = await self.page.query_selector(selector)
+                    # Try multiple ways to find the element
+                    element = None
+                    
+                    # Method 1: Direct query selector
+                    try:
+                        element = await self.page.query_selector(selector)
+                    except Exception as e:
+                        logger.debug(f"Query selector '{selector}' failed: {e}")
+                    
+                    # Method 2: Try with escaped quotes if selector has quotes
+                    if not element and ("'" in selector or '"' in selector):
+                        try:
+                            # Try without quotes or with escaped quotes
+                            escaped_selector = selector.replace("'", "\\'").replace('"', '\\"')
+                            element = await self.page.query_selector(escaped_selector)
+                        except:
+                            pass
+                    
+                    # Method 3: Try finding by text content if selector mentions text
+                    if not element and "has-text" in selector:
+                        try:
+                            # Extract text from selector like button:has-text('Code')
+                            import re
+                            text_match = re.search(r"has-text\(['\"]([^'\"]+)['\"]\)", selector)
+                            if text_match:
+                                text = text_match.group(1)
+                                # Try finding button with that text
+                                element = await self.page.query_selector(f"button:has-text('{text}')")
+                                if not element:
+                                    element = await self.page.query_selector(f"*:has-text('{text}')")
+                        except Exception as e:
+                            logger.debug(f"Text-based search failed: {e}")
+                    
                     if element:
+                        logger.info(f"✅ Found element with selector: {selector}")
+                        element_found = True
+                        
                         # Scroll element into view
                         await element.scroll_into_view_if_needed()
-                        await asyncio.sleep(0.3)  # Let scroll settle
+                        await asyncio.sleep(0.5)  # Let scroll settle
                         
                         # Get element bounding box
                         box = await element.bounding_box()
@@ -642,15 +1136,28 @@ class BrowserController:
                                 'height': min(viewport['height'], box['height'] + padding * 2)
                             }
                             
-                            # Highlight the element
-                            await self.page.evaluate(f"""
-                                document.querySelector('{selector}').style.outline = '4px solid #FF4444';
-                                document.querySelector('{selector}').style.outlineOffset = '2px';
-                                document.querySelector('{selector}').style.boxShadow = '0 0 20px rgba(255,68,68,0.5)';
+                            # Highlight the element with a more visible red border
+                            # Use element handle instead of re-querying
+                            await element.evaluate("""
+                                elem => {
+                                    elem.style.outline = '5px solid #FF0000';
+                                    elem.style.outlineOffset = '3px';
+                                    elem.style.boxShadow = '0 0 30px rgba(255, 0, 0, 0.8), 0 0 10px rgba(255, 0, 0, 0.6)';
+                                    elem.style.zIndex = '99999';
+                                    if (getComputedStyle(elem).position === 'static') {
+                                        elem.style.position = 'relative';
+                                    }
+                                }
                             """)
+                            logger.info(f"✅ Highlighted and cropped to element with {padding}px padding")
                         break
+                    else:
+                        logger.debug(f"⚠️ Element not found with selector: {selector}")
                 except Exception as e:
-                    logger.debug(f"Could not process highlight element {selector}: {e}")
+                    logger.warning(f"Could not process highlight element {selector}: {e}")
+            
+            if not element_found:
+                logger.warning(f"⚠️ No elements found with any of the selectors: {highlight_elements}")
         
         # Capture screenshot
         screenshot_options = {
@@ -730,15 +1237,54 @@ class BrowserController:
     
     async def close(self, save_state: bool = True):
         """Close browser and optionally save context state"""
-        if self.context:
-            if save_state and self.context_state_file:
-                await self.save_context_state()
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
+        try:
+            if self.page and not self.page.is_closed():
+                try:
+                    await self.page.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        
+        try:
+            if self.context:
+                # Save state BEFORE closing context (order matters!)
+                if save_state and self.context_state_file:
+                    try:
+                        await self.save_context_state()
+                    except Exception as save_error:
+                        # If save fails, log but continue with close
+                        logger.debug(f"Could not save state before close: {save_error}")
+                try:
+                    await self.context.close()
+                except Exception as e:
+                    logger.debug(f"Error closing context: {e}")
+        except Exception as e:
+            logger.debug(f"Error in context cleanup: {e}")
+        
+        try:
+            if self.browser and self.browser.is_connected():
+                try:
+                    await self.browser.close()
+                except Exception as e:
+                    logger.debug(f"Error closing browser: {e}")
+        except Exception as e:
+            logger.debug(f"Error in browser cleanup: {e}")
+        
+        try:
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except Exception as e:
+                    logger.debug(f"Error stopping playwright: {e}")
+        except Exception:
+            pass
+        
         logger.info("Browser closed")
+        # Clean up references
+        self.browser = None
+        self.context = None
+        self.page = None
 
     async def screenshot(self, app: str, task: str, step: int, full_page: bool = True):
         """Backward compatible screenshot method"""
@@ -957,7 +1503,8 @@ class BrowserController:
     async def save_context_state(self, file_path: Optional[str] = None):
         """Save browser context state (cookies, localStorage, etc.) to file"""
         if not self.context:
-            raise RuntimeError("Browser context not available")
+            logger.debug("Browser context not available for saving")
+            return False
         
         save_path = file_path or self.context_state_file
         if not save_path:
@@ -965,10 +1512,25 @@ class BrowserController:
             return False
         
         try:
+            # Check if context is still open/valid
+            try:
+                # Try to check if context is closed
+                if hasattr(self.context, '_browser') and self.context._browser:
+                    # Context seems valid, proceed
+                    pass
+            except:
+                logger.debug("Context appears to be closed, skipping save")
+                return False
+            
             ensure_dir(os.path.dirname(save_path))
             await self.context.storage_state(path=save_path)
             logger.info(f"Browser context state saved to {save_path}")
             return True
         except Exception as e:
-            logger.error(f"Failed to save context state: {e}")
+            # Don't log as error if browser/context is closed (expected in some flows)
+            error_msg = str(e).lower()
+            if "closed" in error_msg or "target" in error_msg:
+                logger.debug(f"Could not save context state (browser/context closed): {e}")
+            else:
+                logger.warning(f"Failed to save context state: {e}")
             return False

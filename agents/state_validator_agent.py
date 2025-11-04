@@ -9,7 +9,7 @@ logger = get_logger(name="state_validator_agent")
 
 
 class StateValidatorAgent:
-    def __init__(self, browser: BrowserController, llm_model: str = "gpt-4o"):
+    def __init__(self, browser: BrowserController, llm_model: str = "claude-sonnet-4-5-20250929"):
         self.browser = browser
         self.llm = self._get_llm(llm_model)
         self.agent = Agent(

@@ -1,33 +1,4 @@
 services:
-  backend:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.backend
-    ports:
-      - "8000:8000"
-      - "7900:7900"   # noVNC (optional visual browser)
-    volumes:
-      - ../data/screenshots:/app/data/screenshots
-      - ../data/logs:/app/data/logs
-      - ../data/sessions:/app/data/sessions
-      - ../.env:/app/.env:ro
-      - ../backend:/app/backend
-      - ../agents:/app/agents
-      - ../graph:/app/graph
-      - ../utils:/app/utils
-    env_file:
-      - ../.env
-    environment:
-      - ENV_FILE=/app/.env
-      - VIEW_BROWSER=${VIEW_BROWSER:-false}
-      - PLAYWRIGHT_HEADLESS=${PLAYWRIGHT_HEADLESS:-true}
-      - PLAYWRIGHT_REMOTE_DEBUG_HOST=${PLAYWRIGHT_REMOTE_DEBUG_HOST:-}
-      - PLAYWRIGHT_REMOTE_DEBUG_PORT=${PLAYWRIGHT_REMOTE_DEBUG_PORT:-}
-      - CREWAI_LLM_MODEL=${CREWAI_LLM_MODEL:-gpt-5}
-    networks:
-      - agent-b-network
-    restart: unless-stopped
-
   frontend:
     build:
       context: ..
@@ -42,8 +13,6 @@ services:
       - ../.env
     environment:
       - NODE_ENV=development
-    depends_on:
-      - backend
     networks:
       - agent-b-network
     restart: unless-stopped

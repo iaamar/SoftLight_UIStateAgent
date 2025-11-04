@@ -12,7 +12,7 @@ logger = get_logger(name="ui_navigator_agent")
 
 
 class UINavigatorAgent:
-    def __init__(self, browser: BrowserController, llm_model: str = "gpt-4o"):
+    def __init__(self, browser: BrowserController, llm_model: str = "claude-sonnet-4-5-20250929"):
         self.browser = browser
         self.llm = self._get_llm(llm_model)
         self.agent = Agent(
@@ -81,10 +81,13 @@ class UINavigatorAgent:
         return structure
     
     async def detect_workflow_type(self, task_query: str, page_structure: Dict[str, Any]) -> str:
-        """Determine the type of workflow needed for the task"""
+        """
+        Detect workflow type for logging/metrics purposes only.
+        NOTE: This is NOT used for hardcoded navigation - the LLM generates steps dynamically.
+        """
         task_lower = task_query.lower()
         
-        # Common workflow patterns
+        # Simple categorization for logging/debugging only
         if any(word in task_lower for word in ["create", "new", "add"]):
             if "project" in task_lower:
                 return "create_project"
@@ -117,87 +120,112 @@ class UINavigatorAgent:
         task_query: str, 
         workflow_type: str,
         page_html: str,
-        current_url: str
+        current_url: str,
+        is_logged_in: bool = True  # Default True - authentication handled by API
     ) -> List[Dict[str, Any]]:
-        """Generate navigation steps based on workflow type and page analysis"""
+        """Generate navigation steps dynamically by analyzing the page and understanding the task"""
         
-        # Prepare context-aware prompt
-        workflow_prompts = {
-            "create_project": """
-            For creating a project, typical steps include:
-            1. Click 'New Project' or '+' button
-            2. Fill in project name
-            3. Select project type/template if available
-            4. Configure project settings
-            5. Click 'Create' or 'Save'
-            """,
-            "create_repository": """
-            For creating a repository, typical steps include:
-            1. Click 'New' or 'New repository' button
-            2. Enter repository name
-            3. Add description (optional)
-            4. Choose visibility (public/private)
-            5. Initialize with README if option exists
-            6. Click 'Create repository'
-            """,
-            "filter_search": """
-            For filtering/searching, typical steps include:
-            1. Locate filter button or search box
-            2. Click filter options or enter search terms
-            3. Select filter criteria
-            4. Apply filters
-            5. Verify filtered results
-            """,
-            "settings_navigation": """
-            For settings navigation:
-            1. Click user avatar/menu
-            2. Select 'Settings' or 'Preferences'
-            3. Navigate to specific settings section
-            4. Make configuration changes
-            5. Save changes
-            """
-        }
+        # Authentication context (generic - works for any application)
+        auth_context = """
+**Authentication Status**: 
+✅ User is ALREADY authenticated/logged in (authentication handled separately via API).
+
+**Critical Instructions**:
+- DO NOT generate any login, sign-in, or authentication steps
+- Authentication was already completed before this navigation agent was called
+- If you see "Sign in", "Login", "Sign up", or authentication buttons in the HTML, IGNORE them completely
+- Focus ONLY on completing the user's actual task, not authentication
+- The user can proceed directly to the task without any authentication steps
+
+**Your job**: Navigate the authenticated application to complete the task.
+"""
         
-        workflow_hint = workflow_prompts.get(workflow_type, "")
-        
-        # Use the task to generate navigation plan
+        # Fully dynamic prompt - NO hardcoded workflows, NO app-specific logic
         task_description = f"""
-        Task: {task_query}
-        Current URL: {current_url}
-        Workflow Type: {workflow_type}
-        
-        {workflow_hint}
-        
-        IMPORTANT INSTRUCTIONS:
-        1. Analyze the HTML to find EXACT selectors that exist on the page
-        2. Use specific selectors in this priority order:
-           - ID selectors: #element-id
-           - Data attributes: [data-testid="..."], [data-test="..."]
-           - ARIA labels: [aria-label="..."]
-           - Button/link text: button:has-text('...'), a:has-text('...')
-           - Class names (only if unique): .unique-class
-        
-        3. For dynamic content:
-           - Add wait steps after clicks that might trigger loading
-           - Look for spinner/loader elements
-           - Consider modals that might appear
-        
-        4. For form fields:
-           - Use name, id, or placeholder attributes
-           - Include realistic sample data
-        
-        Page HTML Analysis (first 15000 chars):
-        {page_html[:15000]}
-        
-        Generate a JSON array of navigation steps. Each step must have:
-        - action_type: "click", "type", "wait", "select", "hover", "scroll"
-        - selector: Valid CSS/Playwright selector that exists in the HTML
-        - description: Human-readable description
-        - text: (for type actions) Text to enter
-        - wait_time: (for wait actions) Seconds to wait
-        - options: (for select actions) Option to select
-        
-        RETURN ONLY VALID JSON ARRAY!
+You are an expert UI navigation agent analyzing a live web application. Your goal is to understand what the user wants to do and generate precise navigation steps by analyzing the actual HTML.
+
+{auth_context}
+
+**User's Task**: {task_query}
+**Current URL**: {current_url}
+
+**Your Instructions**:
+1. VERIFY authentication status by analyzing the HTML:
+   - Look for user avatars, profile menus, account settings, "Sign out"/"Logout" buttons (indicates logged in)
+   - If you see "Sign in", "Login", authentication forms - IGNORE them (user is already authenticated)
+2. ANALYZE the HTML below to understand what elements are available on THIS authenticated page
+3. UNDERSTAND what the user wants to accomplish from their task query
+4. GENERATE a step-by-step navigation plan using ONLY elements that exist in the HTML
+5. SKIP all authentication/login related elements - user is already logged in
+6. Think like a human: What would you click? What forms would you fill?
+
+**Authentication Detection Pattern** (works for any application):
+- Logged IN indicators: User avatar/profile picture, account menu, settings icon, "Sign out"/"Logout" button, user name/email displayed
+- Logged OUT indicators: "Sign in"/"Login" button/link, authentication form visible, "Create account" prompt
+- Since user is authenticated, focus on authenticated UI elements only
+
+**Selector Priority** (use most specific available):
+   - ID selectors: #element-id
+   - Data attributes: [data-testid="..."], [data-test="..."], [data-test-id="..."]
+   - ARIA labels: [aria-label="..."], [aria-labelledby="..."]
+   - Button/link text: button:has-text('Exact Text'), a:has-text('Exact Text')
+   - Role + text: [role="button"]:has-text('Text')
+   - Placeholder: input[placeholder="..."]
+   - Name attribute: input[name="..."], select[name="..."]
+   - Class names (only if unique and semantic): .create-button, .submit-form
+
+**Important Considerations**:
+- Modals/dialogs may appear after clicking certain buttons (look for "new", "create", "add" buttons)
+- Forms may have multiple steps - include all fields you find
+- Wait for dynamic content after actions that load data
+- Some workflows need scrolling to reveal elements
+- **Dropdowns/Menus (CRITICAL)**: 
+  - When you see buttons like "Create", "New", "Add", "..." that typically open dropdowns/menus:
+    1. First step: Click the button (e.g., `button:has-text('Create')`)
+    2. Second step: Wait 1-2 seconds for dropdown to appear
+    3. Third step: Click the menu item using a selector that searches WITHIN the dropdown:
+       - `[role='menu']:visible >> button:has-text('Project')` 
+       - `[role='menuitem']:has-text('Project'):visible`
+       - `.dropdown-menu:visible >> text='Project'`
+       - Or if HTML shows menu structure: analyze the menu container and target items inside
+  - Common dropdown containers: `[role='menu']`, `[role='listbox']`, `.dropdown-menu`, `[class*='menu']`, `[class*='dropdown']`
+  - IMPORTANT: If the HTML doesn't show the dropdown content (it's dynamically rendered), still generate steps assuming the dropdown will appear after clicking the trigger button
+  - For menu items, prefer text-based selectors like `button:has-text('Project')` or `[role='menuitem']:has-text('Project')` - they work universally across applications
+- NEVER include login/authentication steps even if login buttons are visible in HTML
+
+**Page HTML** (analyze this carefully - first 15000 characters):
+{page_html[:15000]}
+
+**Output Format**: Generate a JSON array with steps. Each step object:
+{{
+  "action_type": "click" | "type" | "wait" | "select" | "hover" | "scroll" | "navigate",
+  "selector": "valid CSS/Playwright selector from the HTML above",
+  "description": "Human-readable description of what this step does",
+  "text": "text to type (only for type actions - ALWAYS include dummy/test text if user doesn't specify)",
+  "wait_time": 2 (seconds, for wait actions),
+  "options": "option value (for select dropdowns)"
+}}
+
+**IMPORTANT - Text Generation for Type Actions**:
+- If the user's query specifies exact text to type (e.g., "create a task with name 'Meeting'"), use that exact text
+- If the user's query does NOT specify text (e.g., "how do I create a task?"), ALWAYS generate descriptive placeholder text that guides the user:
+  - For task/project names: "Your task name", "Task name", "Project name", etc.
+  - For descriptions: "Description", "Task description", "Your description"
+  - For names: "Your name", "Name", "Your full name"
+  - For emails: "your.email@example.com" (descriptive placeholder)
+  - For any other field: Use descriptive placeholder text that indicates what should be entered (e.g., "Your title", "Your message", "Your comment")
+- The goal is to guide the user through the UI steps with screenshots showing what to type, using clear placeholder text
+- ALWAYS include "text" field for type actions, using descriptive placeholders that help users understand what to enter
+
+**Critical Rules**:
+- ONLY use selectors for elements that EXIST in the HTML provided
+- NEVER include login, sign-in, or authentication steps (user is already authenticated)
+- Generate descriptive placeholder text for form fields (e.g., "Project name" or "Your task name" to guide users)
+- Include wait steps after clicks that might trigger modals or loading states
+- If you're not sure an element exists, DON'T include that step
+- Return ONLY the JSON array, no explanation text
+
+Generate the navigation steps now:
         """
         
         # Create and execute the task
@@ -349,6 +377,44 @@ class UINavigatorAgent:
             if not enhanced_step["selector"] and enhanced_step["action_type"] != "wait":
                 continue
             
+            # Auto-generate descriptive placeholder text for type actions if missing
+            if enhanced_step["action_type"] == "type" and not enhanced_step.get("text", "").strip():
+                # Generate descriptive placeholder text that guides the user
+                selector_lower = enhanced_step["selector"].lower()
+                desc_lower = enhanced_step["description"].lower()
+                
+                # Determine field type from selector/description and generate helpful placeholder
+                if any(word in selector_lower or word in desc_lower for word in ["name", "title"]):
+                    if "task" in selector_lower or "task" in desc_lower:
+                        enhanced_step["text"] = "Your task name"
+                    elif "project" in selector_lower or "project" in desc_lower:
+                        enhanced_step["text"] = "Project name"
+                    else:
+                        enhanced_step["text"] = "Your name"
+                elif "description" in selector_lower or "description" in desc_lower:
+                    enhanced_step["text"] = "Description"
+                elif any(word in selector_lower or word in desc_lower for word in ["task"]):
+                    enhanced_step["text"] = "Your task name"
+                elif any(word in selector_lower or word in desc_lower for word in ["project"]):
+                    enhanced_step["text"] = "Project name"
+                elif any(word in selector_lower or word in desc_lower for word in ["goal"]):
+                    enhanced_step["text"] = "Your goal"
+                elif any(word in selector_lower or word in desc_lower for word in ["email", "e-mail"]):
+                    enhanced_step["text"] = "your.email@example.com"
+                elif any(word in selector_lower or word in desc_lower for word in ["url", "link", "website"]):
+                    enhanced_step["text"] = "https://example.com"
+                elif any(word in selector_lower or word in desc_lower for word in ["comment", "note", "message"]):
+                    enhanced_step["text"] = "Your comment"
+                else:
+                    # Generic descriptive placeholder - try to extract from placeholder attribute if available
+                    placeholder_match = re.search(r'placeholder[=:]["\']([^"\']+)["\']', selector_lower)
+                    if placeholder_match:
+                        enhanced_step["text"] = placeholder_match.group(1)
+                    else:
+                        enhanced_step["text"] = "Your text"
+                
+                logger.debug(f"Generated placeholder text '{enhanced_step['text']}' for type action: {enhanced_step['selector']}")
+            
             validated_steps.append(enhanced_step)
         
         return validated_steps
@@ -393,6 +459,18 @@ class UINavigatorAgent:
             await self.browser.navigate(app_url)
             await self.browser.wait_for_stable_page()
             
+            # Check login status (authentication handled by API layer - navigation agent only runs if authenticated)
+            login_check = await self.browser.check_login_required()
+            is_logged_in = not login_check.get("requires_login", False)
+            
+            if not is_logged_in:
+                # This shouldn't happen - API should have caught this
+                logger.warning("Navigation agent called but user not authenticated. Returning empty steps.")
+                logger.log_agent_end("UINavigatorAgent", success=False)
+                return []  # Return empty - user needs to authenticate first
+            
+            logger.info(f"User is authenticated - proceeding with task navigation")
+            
             # Analyze page structure
             page_structure = await self.analyze_page_structure()
             logger.info(f"Page structure: {page_structure}")
@@ -410,12 +488,13 @@ class UINavigatorAgent:
             if modals:
                 logger.info(f"Detected {len(modals)} modals on page")
             
-            # Generate navigation steps
+            # Generate navigation steps (user is confirmed authenticated - skip login steps)
             steps = await self.generate_smart_navigation_steps(
                 task_query=task_query,
                 workflow_type=workflow_type,
                 page_html=page_html,
-                current_url=current_url
+                current_url=current_url,
+                is_logged_in=True  # Always true at this point
             )
             
             # Enhance steps with dynamic content handling

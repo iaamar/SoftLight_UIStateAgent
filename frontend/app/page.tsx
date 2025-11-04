@@ -8,6 +8,7 @@ interface Message {
   content: string
   timestamp: Date
   screenshots?: string[]
+  screenshot_metadata?: Array<{path: string, step_index: number, step_number: number | null}>
   step_descriptions?: string[]
   metadata?: any
   loginRequired?: {
@@ -15,6 +16,13 @@ interface Message {
     loginUrl: string
     originalTask: string
   }
+}
+
+interface ProgressUpdate {
+  step: number
+  total_steps: number
+  description: string
+  current_action?: string
 }
 
 function formatTime(date: Date): string {
@@ -51,7 +59,9 @@ export default function Home() {
     oauthProviders?: string[]
     hasPasswordForm?: boolean
   } | null>(null)
+  const [currentProgress, setCurrentProgress] = useState<ProgressUpdate | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
     setMounted(true)
@@ -107,6 +117,32 @@ export default function Home() {
     setMessages(prev => [...prev, userMessage])
     setInput('')
     setLoading(true)
+    setCurrentProgress(null)
+
+    // Connect to WebSocket for progress updates
+    try {
+      const ws = new WebSocket('ws://localhost:8000/ws/progress')
+      wsRef.current = ws
+      
+      ws.onmessage = (event) => {
+        try {
+          const progress = JSON.parse(event.data) as ProgressUpdate
+          setCurrentProgress(progress)
+        } catch (e) {
+          console.error('Failed to parse progress update:', e)
+        }
+      }
+      
+      ws.onerror = (error) => {
+        console.error('WebSocket error:', error)
+      }
+      
+      ws.onclose = () => {
+        console.log('WebSocket closed')
+      }
+    } catch (e) {
+      console.error('Failed to connect to WebSocket:', e)
+    }
 
     try {
       const response = await fetch('http://localhost:8000/api/v1/execute', {
@@ -162,6 +198,7 @@ export default function Home() {
           : `❌ Task failed: ${data.error || 'Unknown error'}`,
         timestamp: new Date(),
         screenshots: data.screenshots || [],
+        screenshot_metadata: data.screenshot_metadata || [],
         step_descriptions: data.step_descriptions || [],
         metadata: data
       }
@@ -177,6 +214,12 @@ export default function Home() {
       setMessages(prev => [...prev, errorMessage])
     } finally {
       setLoading(false)
+      setCurrentProgress(null)
+      // Close WebSocket connection
+      if (wsRef.current) {
+        wsRef.current.close()
+        wsRef.current = null
+      }
     }
   }
 
@@ -228,6 +271,7 @@ export default function Home() {
               : `❌ Task failed: ${data.task_result.error || 'Unknown error'}`,
             timestamp: new Date(),
             screenshots: data.task_result.screenshots || [],
+            screenshot_metadata: data.task_result.screenshot_metadata || [],
             step_descriptions: data.task_result.step_descriptions || [],
             metadata: data.task_result
           }
@@ -501,21 +545,87 @@ export default function Home() {
                           )}
                         </div>
                       )}
-                      {message.screenshots && message.screenshots.length > 0 && (
+                      {/* Show all steps as a list */}
+                      {message.step_descriptions && message.step_descriptions.length > 0 && (
                         <div className="mt-4">
-                          <p className="text-xs text-gray-400 mb-3 uppercase tracking-wider">Screenshots ({message.screenshots.length})</p>
-                          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-                            {message.screenshots.map((screenshot, index) => {
-                              const description = message.step_descriptions?.[index] || `Step ${index + 1}`
+                          <p className="text-xs text-gray-400 mb-3 uppercase tracking-wider">
+                            Workflow Steps ({message.step_descriptions.length})
+                          </p>
+                          <div className="space-y-2">
+                            {message.step_descriptions.map((description, index) => {
+                              // Check if this step has a screenshot using metadata mapping
+                              const screenshotMetadata = message.screenshot_metadata?.find(m => m.step_index === index)
+                              const hasScreenshot = !!screenshotMetadata
+                              const screenshotIndex = hasScreenshot ? 
+                                message.screenshots?.findIndex(s => s === screenshotMetadata?.path) ?? -1 : -1
+                              
                               return (
                                 <div
                                   key={index}
+                                  className={`flex items-start space-x-3 p-3 rounded-lg border ${
+                                    hasScreenshot 
+                                      ? 'border-indigo-500/30 bg-indigo-500/5' 
+                                      : 'border-white/10 bg-white/5'
+                                  }`}
+                                >
+                                  <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-xs font-semibold ${
+                                    hasScreenshot 
+                                      ? 'bg-indigo-500/20 text-indigo-300' 
+                                      : 'bg-gray-500/20 text-gray-400'
+                                  }`}>
+                                    {index + 1}
+                                  </div>
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-sm text-gray-200 leading-relaxed">
+                                      {description}
+                                    </p>
+                                    {hasScreenshot && screenshotIndex >= 0 && (
+                                      <button
+                                        onClick={() => setSelectedScreenshot({
+                                          src: `http://localhost:8000/api/v1/screenshot/${message.screenshots![screenshotIndex]}`,
+                                          index: screenshotIndex,
+                                          all: message.screenshots!.map(s => `http://localhost:8000/api/v1/screenshot/${s}`)
+                                        })}
+                                        className="mt-2 text-xs text-indigo-400 hover:text-indigo-300 flex items-center space-x-1"
+                                      >
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                        </svg>
+                                        <span>View screenshot</span>
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )}
+                      
+                      {/* Show screenshots grid */}
+                      {message.screenshots && message.screenshots.length > 0 && (
+                        <div className="mt-4">
+                          <p className="text-xs text-gray-400 mb-3 uppercase tracking-wider">
+                            Screenshots ({message.screenshots.length})
+                          </p>
+                          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+                            {message.screenshots.map((screenshot, screenshotIndex) => {
+                              // Use metadata to find correct step mapping if available
+                              const metadata = message.screenshot_metadata?.find(m => m.path === screenshot)
+                              const stepIndex = metadata?.step_index ?? screenshotIndex
+                              const description = message.step_descriptions?.[stepIndex] || 
+                                                 message.step_descriptions?.[screenshotIndex] || 
+                                                 `Step ${stepIndex + 1}`
+                              
+                              return (
+                                <div
+                                  key={screenshotIndex}
                                   className="group relative rounded-lg overflow-hidden border border-white/10 hover:border-indigo-500/50 transition-all cursor-pointer hover:scale-105 transform duration-200 flex flex-col"
                                 >
                                   <div
                                     onClick={() => setSelectedScreenshot({
                                       src: `http://localhost:8000/api/v1/screenshot/${screenshot}`,
-                                      index,
+                                      index: screenshotIndex,
                                       all: message.screenshots!.map(s => `http://localhost:8000/api/v1/screenshot/${s}`)
                                     })}
                                     className="aspect-video bg-gradient-to-br from-indigo-500/10 to-purple-500/10 flex items-center justify-center group-hover:from-indigo-500/20 group-hover:to-purple-500/20 transition-all relative overflow-hidden rounded-lg"
@@ -538,7 +648,7 @@ export default function Home() {
                                       <svg className="w-12 h-12 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                                       </svg>
-                                      <p className="text-xs text-gray-400 mt-2">Step {index + 1}</p>
+                                      <p className="text-xs text-gray-400 mt-2">Step {stepIndex + 1}</p>
                                     </div>
                                     <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-all flex items-center justify-center pointer-events-none">
                                       <svg className="w-8 h-8 text-white opacity-0 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -547,8 +657,8 @@ export default function Home() {
                                     </div>
                                   </div>
                                   <div className="p-3 bg-white/5 rounded-b-lg border-t border-white/10">
-                                    <p className="text-xs text-gray-300 line-clamp-3 leading-relaxed" title={description}>
-                                      <span className="text-indigo-400 font-semibold block mb-1">Step {index + 1}</span>
+                                    <p className="text-xs text-gray-300 line-clamp-2 leading-relaxed" title={description}>
+                                      <span className="text-indigo-400 font-semibold block mb-1">Step {stepIndex + 1}</span>
                                       <span className="text-gray-200">{description}</span>
                                     </p>
                                   </div>
@@ -575,15 +685,38 @@ export default function Home() {
             ))}
             {loading && (
               <div className="flex justify-start">
-                <div className="glass-morphism border border-white/10 rounded-2xl p-5">
-                  <div className="flex items-center space-x-3">
-                    <div className="w-8 h-8 rounded-lg bg-purple-500/20 flex items-center justify-center">
+                <div className="glass-morphism border border-white/10 rounded-2xl p-5 max-w-3xl">
+                  <div className="flex items-start space-x-3">
+                    <div className="w-8 h-8 rounded-lg bg-purple-500/20 flex items-center justify-center flex-shrink-0">
                       <svg className="animate-spin h-5 w-5 text-purple-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                         <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                         <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                       </svg>
                     </div>
-                    <p className="text-gray-300">Processing your request...</p>
+                    <div className="flex-1">
+                      <p className="text-gray-300 font-medium mb-2">Processing your request...</p>
+                      {currentProgress && (
+                        <div className="mt-3 space-y-2">
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-gray-400">Progress</span>
+                            <span className="text-indigo-400">
+                              Step {currentProgress.step} of {currentProgress.total_steps || '?'}
+                            </span>
+                          </div>
+                          {currentProgress.total_steps && (
+                            <div className="w-full bg-white/10 rounded-full h-2 overflow-hidden">
+                              <div 
+                                className="bg-gradient-to-r from-indigo-500 to-purple-500 h-full transition-all duration-300"
+                                style={{ width: `${(currentProgress.step / currentProgress.total_steps) * 100}%` }}
+                              />
+                            </div>
+                          )}
+                          <p className="text-sm text-gray-300 mt-2">
+                            {currentProgress.current_action || currentProgress.description || 'Analyzing...'}
+                          </p>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
