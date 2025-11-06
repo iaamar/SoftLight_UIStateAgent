@@ -1,7 +1,7 @@
 from crewai import Agent, Task, Crew
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from utils.logger import get_logger
 from utils.browser_controller import BrowserController
 import hashlib
@@ -13,20 +13,24 @@ logger = get_logger(name="screenshot_agent")
 class ScreenshotAgent:
     def __init__(self, browser: BrowserController, llm_model: str = "claude-sonnet-4-5-20250929"):
         self.browser = browser
+        self.llm_model = llm_model
         self.llm = self._get_llm(llm_model)
         self.agent = Agent(
-            role="Smart Screenshot Capture Specialist",
-            goal="Capture focused, non-duplicate screenshots showing only relevant UI state changes",
-            backstory="""Expert in identifying meaningful UI changes and capturing focused screenshots. 
-            Avoids duplicates and always crops to show only the relevant UI state clearly.""",
+            role="Strategic Screenshot Capture Specialist",
+            goal="Capture screenshots at optimal moments with maximum value using reward-based strategy",
+            backstory="""Expert in determining when screenshots provide maximum value. Uses reward-based 
+            strategy to optimize screenshot capture - only taking screenshots when they capture meaningful 
+            state changes, user actions, or workflow milestones. Avoids redundant captures and ensures 
+            each screenshot tells a story of the workflow progression.""",
             verbose=True,
             llm=self.llm
         )
-        # State tracking for duplicate detection
+        # State tracking for duplicate detection and reward calculation
         self.previous_states: List[Dict[str, Any]] = []
         self.last_screenshot_hash: Optional[str] = None
         self.last_url: Optional[str] = None
-        self.last_visible_text_hash: Optional[str] = None
+        self.navigation_plan: Optional[List[Dict[str, Any]]] = None
+        self.reward_scores: List[float] = []  # Track reward scores for optimization
     
     def _get_llm(self, model: str):
         import os
@@ -44,97 +48,160 @@ class ScreenshotAgent:
                 raise ValueError("OPENAI_API_KEY not found")
             return ChatOpenAI(model=model, api_key=api_key)
     
+    def set_navigation_plan(self, navigation_steps: List[Dict[str, Any]]):
+        """Set the navigation plan for strategic screenshot decisions"""
+        self.navigation_plan = navigation_steps
+        logger.debug(f"Navigation plan set with {len(navigation_steps)} steps")
+    
     async def _compute_page_state_hash(self) -> str:
         """Compute a hash of the current page state for duplicate detection"""
         try:
-            # Get key state indicators
             url = await self.browser.get_url()
             visible_text = await self.browser.get_page_text()
-            
-            # Check for modals/dialogs
             modals = await self.browser.detect_and_handle_modals()
             modal_text = " ".join([m.get("text", "") for m in modals])
-            
-            # Get form state
             forms = await self.browser.detect_forms()
             form_count = len(forms)
             
             # Create combined state representation
             state_string = f"{url}|{visible_text[:5000]}|{modal_text}|{form_count}"
-            
-            # Hash it
             return hashlib.md5(state_string.encode()).hexdigest()
         except Exception as e:
             logger.warning(f"Could not compute page state hash: {e}")
             return hashlib.md5(str(asyncio.get_event_loop().time()).encode()).hexdigest()
     
-    async def _detect_meaningful_change(self) -> Dict[str, Any]:
-        """Detect if there's a meaningful change worth capturing - improved duplicate detection"""
-        current_url = await self.browser.get_url()
+    async def _calculate_reward_score(
+        self,
+        step: int,
+        action_type: Optional[str] = None,
+        action_success: bool = True,
+        context: Optional[str] = None
+    ) -> float:
+        """
+        Calculate reward score for taking a screenshot at this moment.
+        Higher score = more valuable screenshot.
+        Returns score between 0.0 and 1.0
+        """
+        reward = 0.0
+        
+        # Base reward for initial state
+        if step == 0:
+            return 1.0  # Always capture initial state
+        
+        # Reward based on action type and success
+        if action_type:
+            action_rewards = {
+                "click": 0.8 if action_success else 0.2,  # High reward for successful clicks
+                "type": 0.9 if action_success else 0.1,  # Very high for successful typing (form filling)
+                "select": 0.7 if action_success else 0.2,
+                "navigate": 1.0 if action_success else 0.0,  # Always capture navigation
+                "wait": 0.3,  # Low reward for waits
+                "scroll": 0.2,  # Very low for scrolls
+                "hover": 0.1,  # Minimal reward
+            }
+            reward += action_rewards.get(action_type, 0.5)
+        
+        # Reward for state changes
         current_state_hash = await self._compute_page_state_hash()
+        if self.last_screenshot_hash and current_state_hash != self.last_screenshot_hash:
+            reward += 0.4  # State changed significantly
         
-        # Detect what changed
-        changes = {
-            "has_change": False,
-            "url_changed": False,
-            "content_changed": False,
-            "modal_appeared": False,
-            "form_detected": False,
-            "change_description": ""
-        }
-        
-        # First screenshot always captures
-        if not self.last_screenshot_hash:
-            changes["has_change"] = True
-            changes["change_description"] = "Initial state"
-            return changes
-        
-        # Check URL change (always significant)
+        # Reward for URL changes
+        current_url = await self.browser.get_url()
         if self.last_url and current_url != self.last_url:
-            changes["url_changed"] = True
-            changes["has_change"] = True
-            changes["change_description"] = f"URL changed"
-            return changes
+            reward += 0.5  # URL changed = navigation milestone
         
-        # Check content change - only if hash actually differs
-        if current_state_hash != self.last_screenshot_hash:
-            changes["content_changed"] = True
-            changes["has_change"] = True
-            changes["change_description"] = "Page content changed"
+        # Reward for modal appearance
+        modals = await self.browser.detect_and_handle_modals()
+        if modals:
+            # Check if this is a new modal (not already captured)
+            modal_already_seen = False
+            for prev_state in self.previous_states[-3:]:
+                prev_modals = prev_state.get("modals", [])
+                if prev_modals and modals[0].get('text', '')[:50] in str(prev_modals):
+                    modal_already_seen = True
+                    break
+            if not modal_already_seen:
+                reward += 0.6  # New modal = important state
+        
+        # Reward for form interactions
+        forms = await self.browser.detect_forms()
+        if forms:
+            reward += 0.5  # Form visible = important state
+        
+        # Reward based on navigation plan context
+        if self.navigation_plan and step < len(self.navigation_plan):
+            current_step_info = self.navigation_plan[step]
+            step_action = current_step_info.get("action_type", "")
             
-            # Check for NEW modals (not the same one we've seen before)
+            # Milestone steps get higher reward
+            if step_action == "click" and any(word in current_step_info.get("description", "").lower() 
+                                            for word in ["create", "submit", "confirm", "save", "finish"]):
+                reward += 0.3  # Milestone actions
+        
+        # Penalty for duplicate states
+        if self.last_screenshot_hash and current_state_hash == self.last_screenshot_hash:
+            reward *= 0.1  # Heavy penalty for duplicates
+        
+        # Penalty for wait actions unless state actually changed
+        if action_type == "wait" and current_state_hash == self.last_screenshot_hash:
+            reward *= 0.2
+        
+        # Ensure score is between 0 and 1
+        return min(1.0, max(0.0, reward))
+    
+    async def _should_capture_screenshot(
+        self,
+        step: int,
+        action_type: Optional[str] = None,
+        action_success: bool = True,
+        context: Optional[str] = None,
+        force: bool = False
+    ) -> Tuple[bool, float, str]:
+        """
+        Decide whether to capture screenshot based on reward-based strategy.
+        Returns: (should_capture, reward_score, reason)
+        """
+        if force:
+            return (True, 1.0, "forced")
+        
+        # Always capture initial state
+        if step == 0:
+            return (True, 1.0, "initial_state")
+        
+        # Calculate reward score
+        reward_score = await self._calculate_reward_score(step, action_type, action_success, context)
+        
+        # Decision threshold: only capture if reward > 0.5 (moderate value)
+        # But be more lenient for high-value actions (type, click milestones)
+        threshold = 0.5
+        if action_type in ["type", "navigate"]:
+            threshold = 0.4  # Lower threshold for high-value actions
+        elif action_type == "wait":
+            threshold = 0.7  # Higher threshold for low-value actions
+        
+        should_capture = reward_score >= threshold
+        
+        # Generate reason
+        if should_capture:
+            reasons = []
+            if reward_score >= 0.8:
+                reasons.append("high_value")
+            if action_type in ["type", "navigate"]:
+                reasons.append(f"critical_{action_type}")
+            current_url = await self.browser.get_url()
+            if current_url != self.last_url:
+                reasons.append("url_change")
             modals = await self.browser.detect_and_handle_modals()
             if modals:
-                # Check if we've already captured this modal before
-                modal_text = modals[0].get('text', '')[:100]  # First 100 chars for comparison
-                
-                # Look in previous states to see if this modal was already captured
-                modal_already_seen = False
-                for prev_state in self.previous_states[-3:]:  # Check last 3 states
-                    prev_context = prev_state.get("context", "")
-                    if modal_text and modal_text in prev_context:
-                        modal_already_seen = True
-                        break
-                
-                if not modal_already_seen:
-                    changes["modal_appeared"] = True
-                    changes["change_description"] = f"New modal/dialog detected"
-                else:
-                    # Same modal - don't treat as new change
-                    logger.debug(f"Modal already captured in previous state, not treating as new change")
-            else:
-                # Check for forms (only if no modal)
-                forms = await self.browser.detect_forms()
-                if forms:
-                    changes["form_detected"] = True
-                    changes["change_description"] = f"Form with {len(forms[0].get('fields', []))} fields detected"
+                reasons.append("modal_appeared")
+            reason = "_".join(reasons) if reasons else "state_change"
         else:
-            # Same hash = truly identical state
-            logger.debug(f"No change detected - same state hash: {current_state_hash[:8]}")
+            reason = "low_reward"
         
-        return changes
+        return (should_capture, reward_score, reason)
     
-    async def _identify_focus_elements(self, context: Optional[str] = None) -> List[str]:
+    async def _identify_focus_elements(self, context: Optional[str] = None, action_type: Optional[str] = None) -> List[str]:
         """Identify which elements to focus on/highlight in the screenshot"""
         focus_elements = []
         
@@ -144,7 +211,7 @@ class ScreenshotAgent:
             focus_elements.append("[role='dialog']")
             focus_elements.append("[aria-modal='true']")
             logger.info("Focusing on modal/dialog")
-            return focus_elements  # Modals take priority
+            return focus_elements
         
         # Check for forms
         forms = await self.browser.detect_forms()
@@ -156,53 +223,19 @@ class ScreenshotAgent:
         # If context mentions specific elements, try to find them
         if context:
             context_lower = context.lower()
-            
-            # Extract element names from context (look for quoted text or specific keywords)
             import re
             
-            # Look for quoted element names (e.g., "Code" button, 'Clone URL')
+            # Extract element names from context
             quoted_elements = re.findall(r'[\'"]([^\'"]+)[\'"]', context)
             
-            # Common GitHub/clone-related selectors
+            # Common patterns
             if "code" in context_lower or any("code" in e.lower() for e in quoted_elements):
-                # GitHub Code button dropdown
                 focus_elements.extend([
                     "summary[aria-label*='Code']",
                     "button:has-text('Code')",
-                    "[data-testid='code-button']",
-                    ".Button--primary:has-text('Code')"
+                    "[data-testid='code-button']"
                 ])
             
-            if "clone" in context_lower or "copy" in context_lower:
-                # Clone/Copy buttons and URLs
-                focus_elements.extend([
-                    "button:has-text('Copy')",
-                    "button[aria-label*='copy' i]",
-                    "[data-clipboard-target]",
-                    "input[readonly][value*='github.com']",
-                    ".Box:has(input[readonly])",
-                    "button[aria-label*='Copy URL']",
-                    "button:has-text('Clone')"
-                ])
-            
-            if "https" in context_lower:
-                # HTTPS clone URL field
-                focus_elements.extend([
-                    "input[readonly][value*='https://']",
-                    ".Box:has(input[readonly][value*='https://'])",
-                    "[data-testid='clone-url']"
-                ])
-            
-            # Look for buttons mentioned in context
-            if "button" in context_lower or "click" in context_lower:
-                # Try to find recently interacted buttons
-                focus_elements.extend([
-                    "button:focus",
-                    "button:hover",
-                    "[role='button']:focus"
-                ])
-            
-            # Look for specific UI patterns
             if "create" in context_lower or "new" in context_lower:
                 focus_elements.extend([
                     "[data-testid*='create']",
@@ -211,16 +244,9 @@ class ScreenshotAgent:
                     "button:has-text('New')"
                 ])
             
-            if "filter" in context_lower or "search" in context_lower:
-                focus_elements.extend([
-                    "[role='searchbox']",
-                    "[data-testid*='filter']",
-                    "input[type='search']"
-                ])
-            
-            # For any quoted element names, try to find buttons/links with that text
+            # For quoted elements, try to find buttons/links with that text
             for element_name in quoted_elements:
-                if len(element_name) > 2:  # Ignore very short names
+                if len(element_name) > 2:
                     focus_elements.extend([
                         f"button:has-text('{element_name}')",
                         f"[aria-label*='{element_name}' i]",
@@ -235,188 +261,76 @@ class ScreenshotAgent:
                 seen.add(elem)
                 unique_elements.append(elem)
         
-        return unique_elements[:5]  # Limit to 5 selectors to avoid performance issues
+        return unique_elements[:5]  # Limit to 5 selectors
     
     async def capture_screenshot(
-        self, 
-        app: str, 
-        task: str, 
-        step: int, 
+        self,
+        app: str,
+        task: str,
+        step: int,
         context: Optional[str] = None,
-        force: bool = False
+        force: bool = False,
+        action_type: Optional[str] = None,
+        action_success: bool = True
     ) -> Optional[str]:
         """
-        Capture a smart, focused screenshot only if there's a meaningful change.
+        Capture screenshot using reward-based strategy.
+        Only captures when reward score exceeds threshold.
         
         Args:
             app: Application name
             task: Task name
             step: Step number
             context: Context about what just happened
-            force: Force capture even if no change detected
+            force: Force capture even if reward is low
+            action_type: Type of action that just occurred (click, type, etc.)
+            action_success: Whether the action succeeded
         
         Returns:
-            Screenshot path if captured, None if skipped (duplicate)
+            Screenshot path if captured, None if skipped (low reward)
         """
         logger.log_agent_start("ScreenshotAgent", task=f"Step {step}")
         
         try:
-            # Check if browser/page is still available before proceeding
+            # Check if browser/page is available
             try:
                 if not self.browser.page or self.browser.page.is_closed():
-                    logger.warning(f"⚠️ Browser page is closed - cannot capture screenshot at step {step}")
-                    logger.log_agent_end("ScreenshotAgent", success=False)
+                    logger.warning(f"Browser page is closed - cannot capture screenshot at step {step}")
                     return None
-            except Exception as check_error:
-                # If check fails, browser might be closed
-                logger.warning(f"⚠️ Cannot check browser state - browser may be closed: {check_error}")
-                logger.log_agent_end("ScreenshotAgent", success=False)
+            except Exception:
+                logger.warning(f"Cannot check browser state - browser may be closed")
                 return None
             
             # Wait for page to stabilize
             await self.browser.wait_for_stable_page(stability_time=0.5, max_wait=3.0)
             
-            # Detect if there's a meaningful change
-            # Balance: Capture meaningful actions but avoid true duplicates
-            if not force:
-                changes = await self._detect_meaningful_change()
-                current_url = await self.browser.get_url()
-                current_hash = await self._compute_page_state_hash()
-                
-                # Check if URL changed (always capture on URL change)
-                url_changed = current_url != self.last_url
-                
-                # Always capture initial state
-                if step == 0:
-                    logger.info(f"📸 Capturing initial state at step {step}")
-                    should_capture = True
-                elif not self.last_screenshot_hash:
-                    # No previous screenshot - always capture
-                    logger.info(f"📸 No previous screenshot - capturing at step {step}")
-                    should_capture = True
-                elif url_changed:
-                    # URL changed - always capture
-                    logger.info(f"📸 Change detected: URL changed")
-                    should_capture = True
-                elif changes["has_change"]:
-                    # Content actually changed - capture it
-                    logger.info(f"📸 Change detected: {changes['change_description']}")
-                    should_capture = True
-                elif context:
-                    # Check if this is a meaningful action that should always be captured
-                    context_lower = context.lower()
-                    
-                    # Extract action type from context - prioritize meaningful actions
-                    action_type = None
-                    action_keywords = []
-                    
-                    # Prioritize click/type/select over wait - these are user actions
-                    # Check for click actions (includes "click on", "click the", etc.)
-                    if "click" in context_lower and "wait" not in context_lower:  # Make sure "click" in wait doesn't match
-                        action_type = "click"
-                        action_keywords = ["click", "button"]
-                        logger.debug(f"Detected click action from: {context[:50]}")
-                    # Check for type/enter actions - very permissive, check "enter text" first
-                    elif ("enter text" in context_lower or 
-                          (("enter" in context_lower or "type" in context_lower) and "text" in context_lower)):
-                        action_type = "type"
-                        action_keywords = ["type", "enter", "text"]
-                        logger.debug(f"Detected type action from: {context[:50]}")
-                    elif "enter" in context_lower or "type" in context_lower:
-                        # Catch any remaining enter/type patterns (includes "Enter text")
-                        action_type = "type"
-                        action_keywords = ["type", "enter"]
-                        logger.debug(f"Detected type action from: {context[:50]}")
-                    elif "select" in context_lower:
-                        action_type = "select"
-                        action_keywords = ["select"]
-                        logger.debug(f"Detected select action from: {context[:50]}")
-                    elif "wait" in context_lower:
-                        action_type = "wait"
-                        logger.debug(f"Detected wait action from: {context[:50]}")
-                        # For wait steps, be more lenient - capture if there's any hint of change
-                        # or if content hash actually changed
-                        if changes["has_change"]:
-                            logger.info(f"📸 Capturing wait step: {context[:50]} - change detected")
-                            should_capture = True
-                        elif len(self.previous_states) >= 2:
-                            # Capture wait if it's been a few steps since last screenshot
-                            logger.info(f"📸 Capturing wait step: {context[:50]} - enough steps passed")
-                            should_capture = True
-                        else:
-                            logger.info(f"⏭️ Skipping wait step {step} - no change and too recent")
-                            logger.log_agent_end("ScreenshotAgent", success=True)
-                            return None
-                    
-                    # Skip wait handling if we already processed it above
-                    if action_type == "wait" and should_capture:
-                        pass  # Already handled
-                    # Always capture meaningful actions (click, type, select) even if state is similar
-                    elif action_type in ["click", "type", "select"]:
-                        # Only skip if it's the EXACT same action on EXACT same element with identical hash from immediately previous step
-                        # Extract the element name from context to compare
-                        recent_exact_duplicate = False
-                        if len(self.previous_states) > 0:
-                            last_state = self.previous_states[-1]
-                            prev_hash = last_state.get("hash")
-                            prev_context = last_state.get("context", "").lower()
-                            
-                            # Normalize contexts by removing metadata suffixes
-                            context_normalized = context_lower.replace(" (a popup or menu appeared)", "").replace(" (entered information)", "").strip()
-                            prev_context_normalized = prev_context.replace(" (a popup or menu appeared)", "").replace(" (entered information)", "").strip()
-                            
-                            # Only skip if it's EXACTLY the same text AND same hash
-                            # Don't check for same element - different elements with same action should be captured
-                            if prev_hash == current_hash and context_normalized == prev_context_normalized:
-                                recent_exact_duplicate = True
-                        
-                        if recent_exact_duplicate:
-                            logger.info(f"⏭️ Skipping duplicate screenshot at step {step} - exact same action text and identical state")
-                            logger.log_agent_end("ScreenshotAgent", success=True)
-                            return None
-                        else:
-                            # Different action text OR different state - always capture meaningful actions
-                            logger.info(f"📸 Capturing {action_type} action: {context[:50]} (prev: {len(self.previous_states)} states)")
-                            should_capture = True
-                    elif action_type == "wait":
-                        # Wait actions already handled above - skip this section
-                        pass
-                    else:
-                        # Unknown action type or no clear action
-                        if current_hash == self.last_screenshot_hash:
-                            logger.info(f"⏭️ Skipping duplicate screenshot at step {step} - identical state, unclear action")
-                            logger.log_agent_end("ScreenshotAgent", success=True)
-                            return None
-                        else:
-                            logger.info(f"📸 Capturing step {step} - different state detected")
-                            should_capture = True
-                else:
-                    # No context, no change - skip if identical
-                    if current_hash == self.last_screenshot_hash:
-                        logger.info(f"⏭️ Skipping duplicate screenshot at step {step} - identical state, no context")
-                        logger.log_agent_end("ScreenshotAgent", success=True)
-                        return None
-                    else:
-                        should_capture = True
-                
-                if not should_capture:
-                    logger.info(f"⏭️ Skipping duplicate screenshot at step {step}")
-                    logger.log_agent_end("ScreenshotAgent", success=True)
-                    return None
+            # Make strategic decision using reward-based approach
+            should_capture, reward_score, reason = await self._should_capture_screenshot(
+                step=step,
+                action_type=action_type,
+                action_success=action_success,
+                context=context,
+                force=force
+            )
             
-            # Identify what to focus on
-            focus_elements = await self._identify_focus_elements(context)
+            if not should_capture:
+                logger.info(f"⏭️ Skipping screenshot at step {step} - reward score {reward_score:.2f} < threshold (reason: {reason})")
+                logger.log_agent_end("ScreenshotAgent", success=True)
+                return None
             
-            # Determine if we should use full page or smart crop
+            logger.info(f"📸 Capturing screenshot at step {step} - reward score: {reward_score:.2f} (reason: {reason})")
+            
+            # Identify focus elements for smart cropping
+            focus_elements = await self._identify_focus_elements(context, action_type)
+            
+            # Determine screenshot strategy
             use_full_page = False
             highlight_elements = []
             
             if focus_elements:
-                # Use smart cropping with highlights
                 highlight_elements = focus_elements
                 logger.info(f"Using smart crop focusing on: {focus_elements[0]}")
             else:
-                # No specific focus - capture viewport only (not full page)
                 logger.info("No specific focus elements - capturing viewport")
             
             # Capture the screenshot
@@ -428,35 +342,45 @@ class ScreenshotAgent:
                 highlight_elements=highlight_elements if highlight_elements else None
             )
             
-            # Update state tracking (only if screenshot was successfully captured)
+            # Update state tracking
             try:
-                self.last_screenshot_hash = await self._compute_page_state_hash()
-                self.last_url = await self.browser.get_url()
+                current_url = await self.browser.get_url()
+                current_hash = await self._compute_page_state_hash()
+                modals = await self.browser.detect_and_handle_modals()
+                
+                self.last_screenshot_hash = current_hash
+                self.last_url = current_url
+                self.reward_scores.append(reward_score)
                 
                 self.previous_states.append({
                     "step": step,
-                    "url": self.last_url,
-                    "hash": self.last_screenshot_hash,
+                    "url": current_url,
+                    "hash": current_hash,
                     "context": context,
-                    "screenshot_path": screenshot_path
+                    "reward_score": reward_score,
+                    "reason": reason,
+                    "action_type": action_type,
+                    "screenshot_path": screenshot_path,
+                    "modals": modals
                 })
+                
+                # Keep only last 10 states for efficiency
+                if len(self.previous_states) > 10:
+                    self.previous_states = self.previous_states[-10:]
             except Exception as state_error:
-                # If state tracking fails, log but don't fail the screenshot
-                logger.warning(f"⚠️ Could not update state tracking: {state_error}")
+                logger.warning(f"Could not update state tracking: {state_error}")
             
-            logger.info(f"✅ Screenshot captured: {screenshot_path}")
+            logger.info(f"✅ Screenshot captured: {screenshot_path} (reward: {reward_score:.2f})")
             logger.log_agent_end("ScreenshotAgent", success=True)
             return screenshot_path
             
         except Exception as e:
             error_msg = str(e).lower()
-            # Check if browser/context is closed - this is expected in some scenarios
-            if "closed" in error_msg or "target page" in error_msg or "browser" in error_msg and "closed" in error_msg:
-                logger.warning(f"⚠️ Browser/context closed - cannot capture screenshot at step {step}: {e}")
+            if "closed" in error_msg or "target page" in error_msg:
+                logger.warning(f"Browser/context closed - cannot capture screenshot at step {step}: {e}")
                 logger.log_agent_end("ScreenshotAgent", success=False)
-                return None  # Return None instead of raising to allow workflow to continue
+                return None
             else:
-                # For other errors, log and raise
                 logger.log_error(e, context={"agent": "ScreenshotAgent", "step": step})
                 logger.log_agent_end("ScreenshotAgent", success=False)
                 raise
@@ -465,10 +389,18 @@ class ScreenshotAgent:
         """Get all captured states for analysis"""
         return self.previous_states
     
+    def get_average_reward_score(self) -> float:
+        """Get average reward score for optimization analysis"""
+        if not self.reward_scores:
+            return 0.0
+        return sum(self.reward_scores) / len(self.reward_scores)
+    
     def reset_state(self):
         """Reset state tracking (useful between different tasks)"""
         self.previous_states = []
         self.last_screenshot_hash = None
         self.last_url = None
-        self.last_visible_text_hash = None
+        self.reward_scores = []
+        self.navigation_plan = None
         logger.info("Screenshot agent state reset")
+

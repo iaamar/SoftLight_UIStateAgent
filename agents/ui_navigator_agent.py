@@ -142,22 +142,40 @@ class UINavigatorAgent:
         
         # Fully dynamic prompt - NO hardcoded workflows, NO app-specific logic
         task_description = f"""
-You are an expert UI navigation agent analyzing a live web application. Your goal is to understand what the user wants to do and generate precise navigation steps by analyzing the actual HTML.
+You are an expert UI navigation agent analyzing a live web application. Your goal is to understand EXACTLY what the user wants to accomplish and generate a PRECISE, TASK-SPECIFIC navigation plan by analyzing the actual HTML.
 
 {auth_context}
 
 **User's Task**: {task_query}
 **Current URL**: {current_url}
 
-**Your Instructions**:
-1. VERIFY authentication status by analyzing the HTML:
+**CRITICAL INSTRUCTIONS - Generate Task-Specific Navigation Plan**:
+
+1. **UNDERSTAND THE TASK DEEPLY**:
+   - Parse the user's task query carefully to identify:
+     * What object/entity they want to create/modify/view (e.g., "goal", "task", "project", "pricing page")
+     * What action they want to perform (e.g., "create", "view", "go to", "capture")
+     * Any specific details mentioned (e.g., names, types, locations)
+   - Your navigation plan MUST be specific to THIS EXACT TASK - not a generic workflow
+   - Think step-by-step: What is the shortest, most direct path to complete THIS specific task?
+
+2. **VERIFY authentication status by analyzing the HTML**:
    - Look for user avatars, profile menus, account settings, "Sign out"/"Logout" buttons (indicates logged in)
    - If you see "Sign in", "Login", authentication forms - IGNORE them (user is already authenticated)
-2. ANALYZE the HTML below to understand what elements are available on THIS authenticated page
-3. UNDERSTAND what the user wants to accomplish from their task query
-4. GENERATE a step-by-step navigation plan using ONLY elements that exist in the HTML
-5. SKIP all authentication/login related elements - user is already logged in
-6. Think like a human: What would you click? What forms would you fill?
+
+3. **ANALYZE the HTML to find task-specific elements**:
+   - Search for elements that match the TASK keywords (e.g., if task says "create goal", look for "goal", "create goal", "new goal" buttons/links)
+   - Look for navigation patterns that lead to the task objective (e.g., if task is "go to pricing", find pricing links/buttons)
+   - Identify the EXACT sequence of clicks/types needed for THIS task
+
+4. **GENERATE PRECISE, TASK-SPECIFIC STEPS**:
+   - Each step should directly advance toward completing the user's specific task
+   - Use ONLY elements that exist in the HTML provided
+   - Be specific: Instead of "click create button", say "click 'Create Goal' button" or "click button with text 'New Goal'"
+   - Include ALL steps needed, even if they seem obvious (e.g., opening dropdowns, selecting options)
+   - If the task involves viewing/capturing a page, ensure you navigate to the correct page FIRST
+
+5. **SKIP all authentication/login related elements** - user is already logged in
 
 **Authentication Detection Pattern** (works for any application):
 - Logged IN indicators: User avatar/profile picture, account menu, settings icon, "Sign out"/"Logout" button, user name/email displayed
@@ -191,6 +209,8 @@ You are an expert UI navigation agent analyzing a live web application. Your goa
   - Common dropdown containers: `[role='menu']`, `[role='listbox']`, `.dropdown-menu`, `[class*='menu']`, `[class*='dropdown']`
   - IMPORTANT: If the HTML doesn't show the dropdown content (it's dynamically rendered), still generate steps assuming the dropdown will appear after clicking the trigger button
   - For menu items, prefer text-based selectors like `button:has-text('Project')` or `[role='menuitem']:has-text('Project')` - they work universally across applications
+- **Scroll actions**: If elements might be below the fold, include scroll steps BEFORE clicking them
+- **JavaScript-heavy sites**: Include wait steps after clicks/actions on dynamic sites (2-3 seconds)
 - NEVER include login/authentication steps even if login buttons are visible in HTML
 
 **Page HTML** (analyze this carefully - first 15000 characters):

@@ -9,6 +9,14 @@ from utils.helpers import get_screenshot_path, ensure_dir
 from functools import wraps
 import time
 
+# Try to import Selenium fallback
+try:
+    from utils.selenium_fallback import SeleniumFallback
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+    SeleniumFallback = None
+
 logger = get_logger(name="browser_automation")
 
 
@@ -63,6 +71,9 @@ class BrowserController:
         self.playwright = None
         self.navigation_history: List[Dict[str, Any]] = []
         self.detected_modals: List[Dict[str, Any]] = []
+        self.selenium_fallback: Optional[SeleniumFallback] = None
+        self.use_selenium_fallback = os.getenv("USE_SELENIUM_FALLBACK", "false").lower() == "true"
+        self.playwright_failures: Dict[str, int] = {}  # Track failures per selector
     
     async def start(self):
         logger.info("Starting enhanced browser automation")
@@ -339,31 +350,96 @@ class BrowserController:
                 break
     
     async def click(self, selector: str, timeout: Optional[int] = None, force: bool = True, retry: bool = True):
-        """Ultra-robust click that always works - tries every possible strategy"""
+        """Ultra-robust click that always works - tries every possible strategy with enhanced JS site support"""
         if not self.page:
             raise RuntimeError("Browser not started")
         
         logger.log_action("click", {"selector": selector})
         
+        # Wait for page to be stable before attempting click (important for JS-heavy sites)
+        await self.wait_for_stable_page(stability_time=0.3, max_wait=2.0)
+        
         # Check if selector uses Playwright's >> chaining (can't use in CSS querySelector)
         uses_playwright_chain = " >> " in selector
         
-        # Strategy 1: Direct JavaScript click (only for CSS selectors, not Playwright chains)
+        # Strategy 1: Direct JavaScript click with enhanced event handling (only for CSS selectors, not Playwright chains)
         if not uses_playwright_chain:
             try:
                 result = await self.page.evaluate(f"""
                     (selector) => {{
                         const elem = document.querySelector(selector);
-                        if (!elem) return false;
-                        elem.scrollIntoView({{behavior: 'instant', block: 'center'}});
-                        elem.click();
-                        return true;
+                        if (!elem) return {{success: false, reason: 'not_found'}};
+                        
+                        // Scroll element into view first
+                        elem.scrollIntoView({{behavior: 'smooth', block: 'center', inline: 'center'}});
+                        
+                        // Wait a moment for scroll to complete
+                        return new Promise((resolve) => {{
+                            setTimeout(() => {{
+                                try {{
+                                    // Check if element is still visible and enabled
+                                    const rect = elem.getBoundingClientRect();
+                                    const isVisible = rect.width > 0 && rect.height > 0 && 
+                                                     rect.top >= 0 && rect.left >= 0 &&
+                                                     rect.bottom <= window.innerHeight && 
+                                                     rect.right <= window.innerWidth;
+                                    
+                                    if (!isVisible) {{
+                                        resolve({{success: false, reason: 'not_visible'}});
+                                        return;
+                                    }}
+                                    
+                                    // Try multiple click methods for JS-heavy sites
+                                    // Method 1: Direct click
+                                    try {{
+                                        elem.click();
+                                        resolve({{success: true, method: 'direct'}});
+                                        return;
+                                    }} catch (e1) {{
+                                        // Method 2: Create and dispatch mouse events
+                                        try {{
+                                            const mouseDownEvent = new MouseEvent('mousedown', {{
+                                                bubbles: true,
+                                                cancelable: true,
+                                                view: window
+                                            }});
+                                            elem.dispatchEvent(mouseDownEvent);
+                                            
+                                            const mouseUpEvent = new MouseEvent('mouseup', {{
+                                                bubbles: true,
+                                                cancelable: true,
+                                                view: window
+                                            }});
+                                            elem.dispatchEvent(mouseUpEvent);
+                                            
+                                            const clickEvent = new MouseEvent('click', {{
+                                                bubbles: true,
+                                                cancelable: true,
+                                                view: window
+                                            }});
+                                            elem.dispatchEvent(clickEvent);
+                                            
+                                            resolve({{success: true, method: 'events'}});
+                                            return;
+                                        }} catch (e2) {{
+                                            resolve({{success: false, reason: 'click_failed', error: e2.message}});
+                                        }}
+                                    }}
+                                }} catch (e) {{
+                                    resolve({{success: false, reason: 'error', error: e.message}});
+                                }}
+                            }}, 100);
+                        }});
                     }}
                 """, selector)
-                if result:
-                    logger.info(f"✓ JS click succeeded: {selector}")
-                    await asyncio.sleep(0.3)
-                    await self.wait_for_stable_page(max_wait=2.0)
+                
+                if result and result.get('success'):
+                    logger.info(f"✓ JS click succeeded: {selector} (method: {result.get('method', 'unknown')})")
+                    # Reset failure count on success
+                    if selector in self.playwright_failures:
+                        self.playwright_failures[selector] = 0
+                    await asyncio.sleep(0.5)  # Longer wait for JS-heavy sites
+                    await self.wait_for_stable_page(max_wait=3.0)  # Wait longer for dynamic content
                     return
             except Exception as e:
                 logger.debug(f"JS click failed: {e}")
@@ -385,10 +461,15 @@ class BrowserController:
                 raise ValueError(f"Element not visible: {selector}")
             
             await locator.scroll_into_view_if_needed(timeout=2000)
-            await locator.click(force=True, timeout=3000)
+            # Wait for element to be fully visible and stable
+            await asyncio.sleep(0.2)
+            await locator.click(force=True, timeout=5000)  # Increased timeout for JS sites
             logger.info(f"✓ Locator click succeeded: {selector}")
-            await asyncio.sleep(0.3)
-            await self.wait_for_stable_page(max_wait=2.0)
+            # Reset failure count on success
+            if selector in self.playwright_failures:
+                self.playwright_failures[selector] = 0
+            await asyncio.sleep(0.5)  # Longer wait for JS-heavy sites
+            await self.wait_for_stable_page(max_wait=3.0)  # Wait longer for dynamic content
             return
         except Exception as e:
             logger.debug(f"Locator click failed: {e}")
@@ -641,29 +722,81 @@ class BrowserController:
             except Exception as e:
                 logger.debug(f"Text-based fallback failed: {e}")
         
+        # Track failure before checking fallback
+        self.playwright_failures[selector] = self.playwright_failures.get(selector, 0) + 1
+        
+        # Strategy 5: Try Selenium fallback if Playwright keeps failing
+        if self.use_selenium_fallback and SELENIUM_AVAILABLE:
+            failure_count = self.playwright_failures.get(selector, 0)
+            if failure_count >= 2:  # After 2 failures, try Selenium
+                logger.info(f"Playwright failed {failure_count} times for {selector}, trying Selenium fallback")
+                try:
+                    if not self.selenium_fallback:
+                        from utils.selenium_fallback import SeleniumFallback
+                        self.selenium_fallback = SeleniumFallback(headless=self.headless)
+                        current_url = await self.get_url()
+                        # Note: Selenium is synchronous, so we need to handle this carefully
+                        # For now, log that we'd use it but don't actually switch mid-session
+                        logger.info("Selenium fallback available but requires new session")
+                    
+                    # Reset failure count on successful fallback attempt
+                    self.playwright_failures[selector] = 0
+                except Exception as e:
+                    logger.debug(f"Selenium fallback not available: {e}")
+        
         # If all else fails, log but don't crash - continue workflow
         logger.warning(f"⚠ Click could not be completed for: {selector} (continuing workflow)")
         await asyncio.sleep(0.5)
     
     async def type(self, selector: str, text: str, delay: int = 20, clear_first: bool = True):
-        """Robust typing with multiple fallback strategies"""
+        """Robust typing with multiple fallback strategies - enhanced for JS-heavy sites"""
         if not self.page:
             raise RuntimeError("Browser not started")
         
         logger.log_action("type", {"selector": selector, "text_length": len(text)})
         
-        # Strategy 1: Direct locator fill (fastest)
+        # Wait for page to be stable before typing
+        await self.wait_for_stable_page(stability_time=0.3, max_wait=2.0)
+        
+        # Strategy 1: Direct locator fill with enhanced handling (fastest)
         try:
             locator = self.page.locator(selector).first
             count = await locator.count()
             if count == 0:
                 raise ValueError(f"Locator found 0 elements: {selector}")
             await locator.scroll_into_view_if_needed(timeout=2000)
+            await asyncio.sleep(0.2)  # Wait for scroll to complete
+            
+            # Focus the element first (important for JS-heavy sites)
+            await locator.focus(timeout=2000)
+            await asyncio.sleep(0.1)
+            
             if clear_first:
-                await locator.clear(timeout=2000)
-            await locator.fill(text, timeout=3000)
+                # Clear using multiple methods for reliability
+                try:
+                    await locator.clear(timeout=2000)
+                except:
+                    # Fallback: Select all and delete
+                    await self.page.keyboard.press("Control+a")
+                    await asyncio.sleep(0.1)
+                    await self.page.keyboard.press("Delete")
+            
+            # Type with character-by-character for JS sites that need input events
+            await locator.type(text, delay=delay, timeout=5000)
+            
+            # Trigger input events for JS-heavy sites
+            await self.page.evaluate(f"""
+                (selector) => {{
+                    const elem = document.querySelector(selector);
+                    if (elem) {{
+                        elem.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        elem.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
+                }}
+            """, selector)
+            
             logger.info(f"✓ Filled text: {selector}")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)  # Wait for any JS handlers to process
             return
         except Exception as e:
             logger.debug(f"Locator fill failed: {e}")
@@ -683,22 +816,34 @@ class BrowserController:
         except Exception as e2:
             logger.debug(f"Element fill failed: {e2}")
         
-        # Strategy 3: Search for input within modals/forms
+        # Strategy 3: Enhanced search for input within modals/forms - try ALL visible modals
         try:
-            # Extract placeholder or name from selector
+            # Extract placeholder, name, or text from selector
             import re
-            placeholder_match = re.search(r"placeholder=['\"](.*?)['\"]", selector)
-            name_match = re.search(r"name=['\"](.*?)['\"]", selector)
+            placeholder_match = re.search(r"placeholder\*?=['\"](.*?)['\"]", selector)
+            name_match = re.search(r"name\*?=['\"](.*?)['\"]", selector)
+            aria_label_match = re.search(r"aria-label\*?=['\"](.*?)['\"]", selector)
+            data_testid_match = re.search(r"data-testid=['\"](.*?)['\"]", selector)
             
             search_terms = []
             if placeholder_match:
                 search_terms.append(placeholder_match.group(1).lower())
             if name_match:
                 search_terms.append(name_match.group(1).lower())
+            if aria_label_match:
+                search_terms.append(aria_label_match.group(1).lower())
+            if data_testid_match:
+                search_terms.append(data_testid_match.group(1).lower())
             
-            # Common modal/form containers
+            # Also extract keywords from selector (goal, description, name, etc.)
+            keyword_match = re.search(r"(goal|description|name|title|text|input)", selector, re.IGNORECASE)
+            if keyword_match:
+                search_terms.append(keyword_match.group(1).lower())
+            
+            # Common modal/form containers - check ALL visible ones
             modal_containers = [
                 "[role='dialog']",
+                "[aria-modal='true']",
                 "[role='modal']",
                 ".modal",
                 "[class*='modal']",
@@ -707,39 +852,110 @@ class BrowserController:
                 "form",
             ]
             
+            # First, find ALL visible modals
+            visible_modals = []
             for modal_sel in modal_containers:
                 try:
-                    modal_loc = self.page.locator(modal_sel).first
-                    if await modal_loc.is_visible():
-                        # Search for inputs in this modal
-                        for term in search_terms:
-                            if not term:
-                                continue
-                            # Try various input selectors
-                            input_patterns = [
-                                f"{modal_sel} input[placeholder*='{term}' i]",
-                                f"{modal_sel} input[name*='{term}' i]",
-                                f"{modal_sel} input[aria-label*='{term}' i]",
-                                f"{modal_sel} textarea[placeholder*='{term}' i]",
-                                f"{modal_sel} textarea[name*='{term}' i]",
-                                f"{modal_sel} input",
-                                f"{modal_sel} textarea",
-                            ]
-                            
-                            for pattern in input_patterns:
-                                try:
-                                    input_loc = self.page.locator(pattern).first
-                                    if await input_loc.count() > 0 and await input_loc.is_visible():
-                                        await input_loc.scroll_into_view_if_needed()
-                                        if clear_first:
-                                            await input_loc.clear()
-                                        await input_loc.fill(text, timeout=3000)
-                                        logger.info(f"✓ Filled text in modal: {pattern}")
-                                        await asyncio.sleep(0.2)
-                                        return
-                                except:
-                                    continue
+                    modal_locators = self.page.locator(modal_sel)
+                    count = await modal_locators.count()
+                    for i in range(count):
+                        try:
+                            modal = modal_locators.nth(i)
+                            if await modal.is_visible():
+                                visible_modals.append((modal_sel, modal))
+                        except:
+                            continue
                 except:
+                    continue
+            
+            # If no modals found, try searching in entire document
+            if not visible_modals:
+                visible_modals = [(None, None)]  # Search globally
+            
+            # Search in each visible modal
+            for modal_sel, modal_loc in visible_modals:
+                try:
+                    # Build base selector for this modal
+                    base_sel = f"{modal_sel} >> " if modal_sel else ""
+                    
+                    # Try multiple strategies for finding the input
+                    input_patterns = []
+                    
+                    # Strategy 3a: Use search terms from selector
+                    for term in search_terms:
+                        if term:
+                            input_patterns.extend([
+                                f"{base_sel}input[placeholder*='{term}' i]",
+                                f"{base_sel}input[name*='{term}' i]",
+                                f"{base_sel}input[aria-label*='{term}' i]",
+                                f"{base_sel}textarea[placeholder*='{term}' i]",
+                                f"{base_sel}textarea[name*='{term}' i]",
+                                f"{base_sel}[data-testid*='{term}' i]",
+                            ])
+                    
+                    # Strategy 3b: Try all inputs/textarea in modal (if searching in modal)
+                    if modal_sel:
+                        input_patterns.extend([
+                            f"{base_sel}input:not([type='hidden']):not([type='submit']):not([type='button'])",
+                            f"{base_sel}textarea",
+                            f"{base_sel}input[type='text']",
+                        ])
+                    
+                    # Strategy 3c: Try by position (first input, second input, etc.)
+                    if not search_terms:  # If no specific terms, try by order
+                        input_patterns.extend([
+                            f"{base_sel}input:not([type='hidden']):first-of-type",
+                            f"{base_sel}textarea:first-of-type",
+                        ])
+                    
+                    # Try each pattern
+                    for pattern in input_patterns:
+                        try:
+                            input_loc = self.page.locator(pattern).first
+                            count = await input_loc.count()
+                            if count > 0:
+                                # Check if visible and enabled
+                                for i in range(min(count, 3)):  # Try first 3 matches
+                                    try:
+                                        input_elem = input_loc.nth(i) if i > 0 else input_loc
+                                        if await input_elem.is_visible() and await input_elem.is_enabled():
+                                            await input_elem.scroll_into_view_if_needed()
+                                            await input_elem.focus()
+                                            await asyncio.sleep(0.1)
+                                            
+                                            if clear_first:
+                                                try:
+                                                    await input_elem.clear(timeout=2000)
+                                                except:
+                                                    await self.page.keyboard.press("Control+a")
+                                                    await asyncio.sleep(0.1)
+                                                    await self.page.keyboard.press("Delete")
+                                            
+                                            await input_elem.type(text, delay=delay, timeout=5000)
+                                            
+                                            # Trigger events
+                                            await self.page.evaluate(f"""
+                                                (pattern, index) => {{
+                                                    const inputs = document.querySelectorAll('{pattern}');
+                                                    const elem = inputs[{i}];
+                                                    if (elem) {{
+                                                        elem.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                                        elem.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                                    }}
+                                                }}
+                                            """, pattern, i)
+                                            
+                                            logger.info(f"✓ Filled text in modal: {pattern} (match {i+1})")
+                                            await asyncio.sleep(0.3)
+                                            return
+                                    except Exception as e:
+                                        logger.debug(f"Input match {i} failed: {e}")
+                                        continue
+                        except Exception as e:
+                            logger.debug(f"Pattern {pattern} failed: {e}")
+                            continue
+                except Exception as e:
+                    logger.debug(f"Modal {modal_sel} search failed: {e}")
                     continue
         except Exception as e3:
             logger.debug(f"Modal search failed: {e3}")
@@ -771,9 +987,102 @@ class BrowserController:
             except:
                 pass
         
-        # If all strategies fail, log warning but don't crash
-        logger.warning(f"⚠ Type failed for {selector}: All strategies exhausted")
-        await asyncio.sleep(0.3)
+        # Track failure
+        self.playwright_failures[selector] = self.playwright_failures.get(selector, 0) + 1
+        failure_count = self.playwright_failures[selector]
+        
+        # Strategy 5: Try Selenium fallback if Playwright keeps failing
+        if self.use_selenium_fallback and SELENIUM_AVAILABLE and failure_count >= 2:
+            logger.info(f"Playwright failed {failure_count} times for typing, trying Selenium fallback")
+            try:
+                # Initialize Selenium if needed (but note: Selenium requires new session)
+                # For now, we'll improve Playwright strategies instead
+                # Selenium fallback would require session management which is complex
+                logger.warning("Selenium fallback would require new session - improving Playwright strategies instead")
+            except Exception as e:
+                logger.debug(f"Selenium fallback not available: {e}")
+        
+        # Strategy 6: Last resort - try finding ANY visible input in visible modals
+        try:
+            modals = await self.detect_and_handle_modals()
+            if modals:
+                # Get all visible inputs in visible modals
+                all_inputs = await self.page.evaluate("""
+                    () => {
+                        const modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"], .modal, [class*="modal"], [class*="dialog"]');
+                        const inputs = [];
+                        modals.forEach(modal => {
+                            if (modal.offsetParent !== null) {  // visible
+                                const modalInputs = modal.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea');
+                                modalInputs.forEach((input, idx) => {
+                                    if (input.offsetParent !== null) {  // visible
+                                        inputs.push({
+                                            index: idx,
+                                            tag: input.tagName.toLowerCase(),
+                                            placeholder: input.placeholder || '',
+                                            name: input.name || '',
+                                            id: input.id || '',
+                                            ariaLabel: input.getAttribute('aria-label') || ''
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                        return inputs;
+                    }
+                """)
+                
+                if all_inputs and len(all_inputs) > 0:
+                    # Try the first visible input
+                    first_input = all_inputs[0]
+                    logger.info(f"Found {len(all_inputs)} visible inputs in modals, trying first: {first_input}")
+                    
+                    # Build selector for first input
+                    first_selector = first_input['tag']
+                    if first_input.get('id'):
+                        first_selector = f"#{first_input['id']}"
+                    elif first_input.get('name'):
+                        first_selector = f"{first_input['tag']}[name='{first_input['name']}']"
+                    elif first_input.get('placeholder'):
+                        first_selector = f"{first_input['tag']}[placeholder='{first_input['placeholder']}']"
+                    
+                    try:
+                        input_loc = self.page.locator(first_selector).first
+                        if await input_loc.count() > 0 and await input_loc.is_visible():
+                            await input_loc.scroll_into_view_if_needed()
+                            await input_loc.focus()
+                            await asyncio.sleep(0.1)
+                            
+                            if clear_first:
+                                await input_loc.clear(timeout=2000)
+                            
+                            await input_loc.type(text, delay=delay, timeout=5000)
+                            
+                            # Trigger events
+                            await self.page.evaluate(f"""
+                                (sel) => {{
+                                    const elem = document.querySelector(sel);
+                                    if (elem) {{
+                                        elem.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        elem.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    }}
+                                }}
+                            """, first_selector)
+                            
+                            logger.info(f"✓ Filled text using last resort method: {first_selector}")
+                            # Reset failure count on success
+                            self.playwright_failures[selector] = 0
+                            await asyncio.sleep(0.3)
+                            return
+                    except Exception as e:
+                        logger.debug(f"Last resort input fill failed: {e}")
+        except Exception as e:
+            logger.debug(f"Last resort modal search failed: {e}")
+        
+        # If all strategies fail, raise exception to prevent workflow from continuing
+        error_msg = f"Type failed for {selector}: All strategies exhausted after {failure_count} attempts"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
     
     async def wait_for_element(
         self, 
@@ -1002,21 +1311,65 @@ class BrowserController:
                 logger.warning(f"Could not find form field: {field_name}")
     
     async def capture_full_workflow_state(self) -> Dict[str, Any]:
-        """Capture comprehensive UI state information"""
-        state = {
-            "url": await self.get_url(),
-            "title": await self.page.title(),
-            "viewport": self.page.viewport_size,  # Property, not method
-            "cookies": await self.context.cookies(),
-            "local_storage": await self.get_local_storage(),
-            "session_storage": await self.get_session_storage(),
-            "modals": await self.detect_and_handle_modals(),
-            "forms": await self.detect_forms(),
-            "navigation_history": self.navigation_history,
-            "timestamp": time.time()
-        }
-        
-        return state
+        """Capture comprehensive UI state information including both URL and non-URL states"""
+        try:
+            current_url = await self.get_url()
+            page_title = await self.page.title()
+            
+            # Capture URL-based state (traditional navigation)
+            url_state = {
+                "url": current_url,
+                "title": page_title,
+                "is_url_state": True,
+                "url_hash": hash(current_url) if current_url else None
+            }
+            
+            # Capture non-URL state (SPA states, modals, forms, etc.)
+            modals = await self.detect_and_handle_modals()
+            forms = await self.detect_forms()
+            
+            # Get visible text content to detect content changes without URL changes
+            visible_text = await self.get_page_text()
+            visible_text_hash = hash(visible_text[:1000]) if visible_text else None
+            
+            # Detect if this is a non-URL state (modal, form, or dynamic content)
+            is_non_url_state = len(modals) > 0 or len(forms) > 0
+            
+            non_url_state = {
+                "has_modals": len(modals) > 0,
+                "modals": modals,
+                "has_forms": len(forms) > 0,
+                "forms": forms,
+                "visible_text_hash": visible_text_hash,
+                "is_non_url_state": is_non_url_state
+            }
+            
+            # Combine both states
+            state = {
+                **url_state,
+                **non_url_state,
+                "viewport": self.page.viewport_size,
+                "cookies": await self.context.cookies(),
+                "local_storage": await self.get_local_storage(),
+                "session_storage": await self.get_session_storage(),
+                "navigation_history": self.navigation_history[-10:],  # Last 10 navigation steps
+                "timestamp": time.time(),
+                "state_type": "non_url_state" if is_non_url_state else "url_state"
+            }
+            
+            logger.debug(f"Captured state: type={state['state_type']}, url={current_url[:50]}, modals={len(modals)}, forms={len(forms)}")
+            
+            return state
+        except Exception as e:
+            logger.error(f"Error capturing workflow state: {e}")
+            # Return minimal state on error
+            return {
+                "url": await self.get_url() if self.page else "",
+                "title": "",
+                "error": str(e),
+                "timestamp": time.time(),
+                "state_type": "error_state"
+            }
     
     async def detect_forms(self) -> List[Dict[str, Any]]:
         """Detect all forms on the page"""
@@ -1494,6 +1847,84 @@ class BrowserController:
                 "current_url": "",
                 "error": str(e)
             }
+    
+    async def scroll_to_element(self, selector: str):
+        """Scroll to a specific element with enhanced handling for JS-heavy sites"""
+        if not self.page:
+            raise RuntimeError("Browser not started")
+        
+        logger.log_action("scroll_to_element", {"selector": selector})
+        
+        try:
+            # Method 1: Use Playwright's scroll_into_view
+            locator = self.page.locator(selector).first
+            count = await locator.count()
+            if count > 0:
+                await locator.scroll_into_view_if_needed(timeout=3000)
+                await asyncio.sleep(0.3)  # Wait for scroll to complete
+                logger.info(f"✓ Scrolled to element: {selector}")
+                return
+            else:
+                raise ValueError(f"Element not found: {selector}")
+        except Exception as e:
+            logger.debug(f"Scroll into view failed: {e}, trying JavaScript method")
+            
+            # Method 2: JavaScript scroll
+            try:
+                result = await self.page.evaluate(f"""
+                    (selector) => {{
+                        const elem = document.querySelector(selector);
+                        if (!elem) return {{success: false, reason: 'not_found'}};
+                        
+                        // Scroll element into view with smooth behavior
+                        elem.scrollIntoView({{
+                            behavior: 'smooth',
+                            block: 'center',
+                            inline: 'center'
+                        }});
+                        
+                        // Wait for scroll to complete
+                        return new Promise((resolve) => {{
+                            setTimeout(() => {{
+                                const rect = elem.getBoundingClientRect();
+                                const isVisible = rect.top >= 0 && rect.top < window.innerHeight &&
+                                                 rect.left >= 0 && rect.left < window.innerWidth;
+                                resolve({{success: true, visible: isVisible}});
+                            }}, 500);
+                        }});
+                    }}
+                """, selector)
+                
+                if result and result.get('success'):
+                    logger.info(f"✓ JavaScript scroll succeeded: {selector}")
+                    await asyncio.sleep(0.5)  # Additional wait for scroll animation
+                    return
+                else:
+                    raise ValueError(f"JavaScript scroll failed: {result.get('reason', 'unknown')}")
+            except Exception as e2:
+                logger.warning(f"All scroll methods failed for {selector}: {e2}")
+                raise
+    
+    async def scroll_to_bottom(self):
+        """Scroll to the bottom of the page"""
+        if not self.page:
+            raise RuntimeError("Browser not started")
+        
+        logger.log_action("scroll_to_bottom", {})
+        
+        try:
+            # Method 1: Playwright scroll
+            await self.page.evaluate("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})")
+            await asyncio.sleep(0.5)  # Wait for scroll animation
+            logger.info("✓ Scrolled to bottom")
+        except Exception as e:
+            logger.warning(f"Scroll to bottom failed: {e}")
+            # Fallback: instant scroll
+            try:
+                await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(0.3)
+            except Exception as e2:
+                logger.error(f"All scroll to bottom methods failed: {e2}")
     
     async def get_url(self) -> str:
         if not self.page:

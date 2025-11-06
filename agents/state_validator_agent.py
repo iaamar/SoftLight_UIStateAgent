@@ -46,21 +46,47 @@ class StateValidatorAgent:
             
             task = Task(
                 description=f"""
-                Validate the current UI state:
-                Current URL: {current_url}
-                Page content preview: {page_text[:500]}
-                Expected state: {expected_state or 'No specific expectation'}
-                
-                Check:
-                1. Is the page loaded completely?
-                2. Are there any error messages visible?
-                3. Is the expected UI element present?
-                4. Is the state valid for proceeding?
-                
-                Return validation result with:
-                - valid: boolean
-                - issues: list of any issues found
-                - ready_to_proceed: boolean
+You are an expert UI state validator. Your goal is to thoroughly validate the current UI state and determine if it's safe to proceed with the next navigation step.
+
+**Current State Information**:
+- Current URL: {current_url}
+- Page content preview: {page_text[:500]}
+- Expected state: {expected_state or 'No specific expectation'}
+
+**Validation Checklist** (be thorough):
+1. **Page Load Status**: 
+   - Is the page fully loaded? (not showing loading spinners, placeholders, or skeleton screens)
+   - Are there any network errors or failed requests?
+   - Is the DOM stable (not rapidly changing)?
+
+2. **Error Detection**:
+   - Are there any visible error messages, alerts, or warnings?
+   - Check for common error patterns: "Error", "Failed", "Not found", "Unauthorized", "403", "404", "500"
+   - Are there form validation errors?
+   - Any JavaScript console errors that might affect functionality?
+
+3. **Expected Element Presence**:
+   - If an expected state is provided, verify that the expected UI elements are present
+   - Are interactive elements (buttons, forms, links) visible and accessible?
+   - Are there any blocking overlays, modals, or popups that need to be handled?
+
+4. **State Stability**:
+   - Is the page in a stable state (not actively loading content)?
+   - Are there any pending animations or transitions?
+   - Is the UI responsive and ready for user interaction?
+
+5. **Navigation Readiness**:
+   - Can the user proceed with the next step in the workflow?
+   - Are there any blockers preventing progression?
+   - Is the current state appropriate for the expected action?
+
+**Important**: Be specific about any issues found. If there are problems, describe them clearly so they can be addressed.
+
+Return validation result as JSON with:
+- valid: boolean (true if state is valid and ready to proceed)
+- issues: list of strings describing any problems found (empty if no issues)
+- ready_to_proceed: boolean (true if it's safe to continue navigation)
+- state_type: string (e.g., "url_state", "modal_state", "form_state", "loading_state")
                 """,
                 expected_output="A JSON object with valid (boolean), issues (list), and ready_to_proceed (boolean) fields indicating the validation result.",
                 agent=self.agent

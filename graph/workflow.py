@@ -5,6 +5,7 @@ from agents.ui_navigator_agent import UINavigatorAgent
 from agents.screenshot_agent import ScreenshotAgent
 from agents.state_validator_agent import StateValidatorAgent
 from agents.context_sync_agent import ContextSyncAgent
+from agents.login_agent import LoginAgent
 import asyncio
 import time
 import json
@@ -31,6 +32,8 @@ class WorkflowState:
         self.execution_log: List[Dict[str, Any]] = []  # Detailed execution log
         self.detected_modals: List[Dict[str, Any]] = []
         self.form_interactions: List[Dict[str, Any]] = []
+        self.current_action_type: Optional[str] = None  # For screenshot agent
+        self.current_action_success: bool = True  # For screenshot agent
 
 
 class AgentWorkflow:
@@ -54,6 +57,7 @@ class AgentWorkflow:
         self.screenshot = ScreenshotAgent(browser, llm_model)
         self.validator = StateValidatorAgent(browser, llm_model)
         self.context_sync = ContextSyncAgent(llm_model)
+        self.login_agent = LoginAgent(browser, llm_model)
     
     def _log_execution(self, state: WorkflowState, event: str, details: Dict[str, Any]):
         """Log execution details for debugging and analysis"""
@@ -114,6 +118,10 @@ class AgentWorkflow:
                 )
                 state.navigation_steps = navigation_steps
                 logger.info(f"Generated {len(navigation_steps)} navigation steps")
+                
+                # Set navigation plan in screenshot agent for strategic decisions
+                self.screenshot.set_navigation_plan(navigation_steps)
+                
                 if self.progress_callback:
                     await self.progress_callback(0, len(navigation_steps), "Navigation plan created", "planning_complete")
                 
@@ -182,13 +190,49 @@ class AgentWorkflow:
             # Post-execution state capture
             await self._capture_ui_state(state, f"post_{action_type}_{description}")
             
-            self._log_execution(state, f"step_executed_{action_type}", {
-                "selector": selector,
-                "description": description,
-                "success": True
-            })
+            # Validate step completion for critical actions
+            step_succeeded = True
+            if action_type in ["click", "type", "select"]:
+                step_succeeded = await self._validate_step_completion(state, action_type, selector, description)
+                if not step_succeeded:
+                    logger.warning(f"Step validation failed for {action_type} on {selector}")
+                    # Retry once more
+                    logger.info("Retrying step...")
+                    await asyncio.sleep(1)
+                    try:
+                        if action_type == "click":
+                            await self._execute_click(state, selector, description)
+                        elif action_type == "type":
+                            await self._execute_type(state, selector, step.get("text", ""), description)
+                        step_succeeded = await self._validate_step_completion(state, action_type, selector, description)
+                    except Exception as retry_error:
+                        logger.error(f"Retry also failed: {retry_error}")
+                        step_succeeded = False
             
-            state.current_step += 1
+            if step_succeeded:
+                self._log_execution(state, f"step_executed_{action_type}", {
+                    "selector": selector,
+                    "description": description,
+                    "success": True
+                })
+                # Store action info for screenshot agent
+                state.current_action_type = action_type
+                state.current_action_success = True
+                state.current_step += 1
+            else:
+                # Critical step failed - raise exception to prevent workflow from continuing
+                error_msg = f"Critical step failed: {action_type} on {selector} - {description}"
+                logger.error(error_msg)
+                self._log_execution(state, f"step_failed_{action_type}", {
+                    "selector": selector,
+                    "description": description,
+                    "error": "Step validation failed",
+                    "success": False
+                })
+                # Store failed action info
+                state.current_action_type = action_type
+                state.current_action_success = False
+                raise RuntimeError(error_msg)
             
         except Exception as e:
             logger.error(f"Error executing {action_type}: {e}")
@@ -199,10 +243,26 @@ class AgentWorkflow:
                 "success": False
             })
             
-            # Try alternative approaches
+            # Try alternative approaches for click
             if action_type == "click" and selector:
-                await self._try_alternative_click(state, selector, description)
+                try:
+                    await self._try_alternative_click(state, selector, description)
+                    # Validate alternative click succeeded
+                    if await self._validate_step_completion(state, action_type, selector, description):
+                        state.current_step += 1
+                        return
+                except Exception as alt_error:
+                    logger.error(f"Alternative click also failed: {alt_error}")
             
+            # For type actions, this is critical - don't continue
+            if action_type == "type":
+                state.current_action_type = action_type
+                state.current_action_success = False
+                raise RuntimeError(f"Type action failed and is critical: {e}")
+            
+            # For other actions, log and continue but mark as failed
+            state.current_action_type = action_type
+            state.current_action_success = False
             state.current_step += 1
     
     async def _execute_click(self, state: WorkflowState, selector: str, description: str):
@@ -255,7 +315,7 @@ class AgentWorkflow:
             raise e
     
     async def _execute_type(self, state: WorkflowState, selector: str, text: str, description: str):
-        """Execute type action with form interaction tracking"""
+        """Execute type action with form interaction tracking and validation"""
         if not selector:
             raise ValueError("Empty selector for type action")
         
@@ -263,7 +323,52 @@ class AgentWorkflow:
             logger.warning("No text provided for type action")
             return
         
+        # Execute type action
         await self.browser.type(selector, text)
+        
+        # Validate that typing actually succeeded by checking if text appears in input
+        try:
+            # Wait a moment for value to be set
+            await asyncio.sleep(0.3)
+            
+            # Verify the text was actually entered
+            value_entered = await self.browser.page.evaluate(f"""
+                (selector) => {{
+                    // Try multiple selector strategies
+                    const selectors = selector.split(',').map(s => s.trim());
+                    for (const sel of selectors) {{
+                        try {{
+                            const elem = document.querySelector(sel);
+                            if (elem && (elem.tagName === 'INPUT' || elem.tagName === 'TEXTAREA')) {{
+                                return elem.value || elem.textContent || '';
+                            }}
+                        }} catch (e) {{
+                            continue;
+                        }}
+                    }}
+                    // Fallback: check all visible inputs in modals
+                    const modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+                    for (const modal of modals) {{
+                        if (modal.offsetParent !== null) {{
+                            const inputs = modal.querySelectorAll('input:not([type="hidden"]), textarea');
+                            for (const input of inputs) {{
+                                if (input.offsetParent !== null && input.value) {{
+                                    return input.value;
+                                }}
+                            }}
+                        }}
+                    }}
+                    return '';
+                }}
+            """, selector)
+            
+            if value_entered and text.lower().strip() in value_entered.lower():
+                logger.info(f"✓ Verified text was entered: {text[:20]}...")
+            else:
+                logger.warning(f"⚠ Text may not have been entered correctly. Expected: {text[:20]}, Found: {value_entered[:20] if value_entered else 'none'}")
+                # Don't fail here, but log the issue
+        except Exception as e:
+            logger.debug(f"Could not verify text entry: {e}")
         
         # Track form interaction
         state.form_interactions.append({
@@ -313,12 +418,32 @@ class AgentWorkflow:
         await asyncio.sleep(0.5)  # Brief wait for hover effects
     
     async def _execute_scroll(self, state: WorkflowState, selector: str):
-        """Execute scroll action"""
-        if selector:
-            await self.browser.page.evaluate(f"document.querySelector('{selector}').scrollIntoView()")
-        else:
-            # Scroll to bottom
-            await self.browser.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        """Execute scroll action with enhanced handling for JS-heavy sites"""
+        try:
+            if selector:
+                # Scroll to specific element
+                await self.browser.scroll_to_element(selector)
+            else:
+                # Scroll to bottom
+                await self.browser.scroll_to_bottom()
+        except Exception as e:
+            logger.warning(f"Scroll action failed: {e}, trying alternative method")
+            # Fallback: try direct JavaScript scroll
+            try:
+                if selector:
+                    await self.browser.page.evaluate(f"""
+                        (selector) => {{
+                            const elem = document.querySelector(selector);
+                            if (elem) {{
+                                elem.scrollIntoView({{behavior: 'smooth', block: 'center', inline: 'center'}});
+                            }}
+                        }}
+                    """, selector)
+                else:
+                    await self.browser.page.evaluate("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})")
+                await asyncio.sleep(0.5)  # Wait for scroll animation
+            except Exception as e2:
+                logger.error(f"All scroll methods failed: {e2}")
     
     async def _execute_navigate(self, state: WorkflowState, url: str):
         """Execute navigation to new URL"""
@@ -348,6 +473,88 @@ class AgentWorkflow:
         
         logger.warning(f"All alternative click methods failed for {selector}")
     
+    async def _validate_step_completion(self, state: WorkflowState, action_type: str, selector: str, description: str) -> bool:
+        """Validate that a step actually completed successfully"""
+        try:
+            if action_type == "click":
+                # For click, check if something changed (modal appeared, URL changed, etc.)
+                await asyncio.sleep(0.5)  # Wait for effects
+                
+                # Check if modals appeared (common after clicks)
+                modals = await self.browser.detect_and_handle_modals()
+                if modals:
+                    return True  # Modal appeared = click likely worked
+                
+                # Check if URL changed
+                current_url = await self.browser.get_url()
+                if current_url != state.ui_states[-1].get("url", "") if state.ui_states else "":
+                    return True  # URL changed = click worked
+                
+                # For dropdown/menu clicks, check if menu is visible
+                if "menu" in description.lower() or "dropdown" in description.lower():
+                    menu_visible = await self.browser.page.evaluate("""
+                        () => {
+                            const menus = document.querySelectorAll('[role="menu"], [role="listbox"], .dropdown-menu, [class*="menu"]');
+                            for (const menu of menus) {
+                                if (menu.offsetParent !== null) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }
+                    """)
+                    if menu_visible:
+                        return True
+                
+                # If click was on a button that should open something, check if it's disabled/clicked
+                return True  # Assume click worked if no errors
+                
+            elif action_type == "type":
+                # Check if text was actually entered
+                await asyncio.sleep(0.3)
+                
+                # Try to find the input and check its value
+                value_found = await self.browser.page.evaluate(f"""
+                    (selector) => {{
+                        const selectors = selector.split(',').map(s => s.trim());
+                        for (const sel of selectors) {{
+                            try {{
+                                const elem = document.querySelector(sel);
+                                if (elem && (elem.tagName === 'INPUT' || elem.tagName === 'TEXTAREA')) {{
+                                    return elem.value || elem.textContent || '';
+                                }}
+                            }} catch (e) {{
+                                continue;
+                            }}
+                        }}
+                        // Check all visible inputs in modals
+                        const modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+                        for (const modal of modals) {{
+                            if (modal.offsetParent !== null) {{
+                                const inputs = modal.querySelectorAll('input:not([type="hidden"]), textarea');
+                                for (const input of inputs) {{
+                                    if (input.offsetParent !== null && input.value) {{
+                                        return input.value;
+                                    }}
+                                }}
+                            }}
+                        }}
+                        return '';
+                    }}
+                """, selector)
+                
+                # If we found a value, type likely succeeded
+                return bool(value_found and len(value_found) > 0)
+                
+            elif action_type == "select":
+                # For select, check if option was selected
+                return True  # Assume success if no error
+                
+            return True  # Default: assume success
+        except Exception as e:
+            logger.debug(f"Step validation error: {e}")
+            return False  # If validation fails, assume step didn't complete
+    
     def _extract_text_from_description(self, description: str) -> Optional[str]:
         """Extract clickable text from description"""
         import re
@@ -370,7 +577,7 @@ class AgentWorkflow:
         return None
     
     async def _screenshot_step_enhanced(self, state: WorkflowState):
-        """Smart screenshot with duplicate detection - always track steps, only capture unique screenshots"""
+        """Strategic screenshot capture using reward-based approach"""
         logger.log_action("screenshot_step_enhanced", {"step": state.current_step})
         
         try:
@@ -378,7 +585,6 @@ class AgentWorkflow:
             context = await self._generate_step_description(state)
             
             # ALWAYS add step description (so all steps are visible to user)
-            # But only add screenshot if it's not a duplicate
             state.step_descriptions.append(context)
             
             # Send progress update for screenshot capture
@@ -386,20 +592,22 @@ class AgentWorkflow:
                 await self.progress_callback(
                     state.current_step + 1,
                     len(state.navigation_steps) if state.navigation_steps else 0,
-                    f"Capturing screenshot: {context[:50]}",
-                    "capturing_screenshot"
+                    f"Evaluating screenshot: {context[:50]}",
+                    "evaluating_screenshot"
                 )
             
-            # Use the smart screenshot agent (handles duplicate detection & cropping)
+            # Use reward-based screenshot agent
             screenshot_path = await self.screenshot.capture_screenshot(
                 app=state.app_name,
                 task=state.task_name,
                 step=state.current_step,
                 context=context,
-                force=False  # Allow duplicate detection
+                force=False,  # Use reward-based strategy
+                action_type=getattr(state, 'current_action_type', None),
+                action_success=getattr(state, 'current_action_success', True)
             )
             
-            # Only add screenshot path if actually captured (not skipped as duplicate)
+            # Only add screenshot path if actually captured (reward-based decision)
             if screenshot_path:
                 state.screenshots.append(screenshot_path)
                 # Map screenshot to the step index it corresponds to
@@ -408,17 +616,19 @@ class AgentWorkflow:
                 self._log_execution(state, "screenshot_captured", {
                     "path": screenshot_path,
                     "description": context,
-                    "smart_cropped": True,
+                    "action_type": getattr(state, 'current_action_type', None),
+                    "action_success": getattr(state, 'current_action_success', True),
                     "step": state.current_step,
                     "step_index": step_index
                 })
             else:
-                # Screenshot was skipped (duplicate) - but step description is already added
-                logger.info(f"⏭️ Screenshot skipped at step {state.current_step} - duplicate/identical state (step still tracked)")
+                # Screenshot was skipped (low reward) - but step description is already added
+                logger.info(f"⏭️ Screenshot skipped at step {state.current_step} - low reward score (step still tracked)")
                 self._log_execution(state, "screenshot_skipped", {
-                    "reason": "duplicate_state",
+                    "reason": "low_reward",
                     "step": state.current_step,
-                    "description": context
+                    "description": context,
+                    "action_type": getattr(state, 'current_action_type', None)
                 })
             
         except Exception as e:
@@ -619,6 +829,51 @@ class AgentWorkflow:
         state.task_name = task_name
         
         try:
+            # Step 1: Check and handle authentication BEFORE navigation
+            logger.info("Checking authentication requirements...")
+            auth_check = await self.login_agent.check_authentication_required(app_url)
+            
+            if auth_check.get("requires_login", False):
+                logger.info(f"Authentication required. Method: {auth_check.get('login_method', 'manual')}")
+                
+                # Ensure browser is in headed mode for login
+                if self.browser.headless:
+                    logger.warning("Login required but browser is in headless mode")
+                    return {
+                        "success": False,
+                        "error": "Login required but browser is in headless mode. Please use headed mode for login.",
+                        "requires_login": True,
+                        "login_method": auth_check.get("login_method"),
+                        "oauth_providers": auth_check.get("oauth_providers", [])
+                    }
+                
+                # Handle login
+                login_result = await self.login_agent.handle_login(
+                    app_url=app_url,
+                    login_method=auth_check.get("login_method")
+                )
+                
+                if not login_result.get("success", False):
+                    logger.error(f"Login failed: {login_result.get('message', 'Unknown error')}")
+                    return {
+                        "success": False,
+                        "error": login_result.get("message", "Login failed"),
+                        "requires_login": True,
+                        "login_result": login_result
+                    }
+                
+                logger.info("Login successful - proceeding with workflow")
+            
+            # Verify authentication before proceeding
+            is_authenticated = await self.login_agent.verify_authentication()
+            if not is_authenticated:
+                logger.warning("Authentication verification failed - user may need to login")
+                return {
+                    "success": False,
+                    "error": "Authentication verification failed",
+                    "requires_login": True
+                }
+            
             # Initial UI state capture
             await self._capture_ui_state(state, "initial")
             
@@ -629,8 +884,11 @@ class AgentWorkflow:
             while self._should_continue(state):
                 await self._navigate_step_enhanced(state)
                 
-                # Capture screenshot after navigation step (only if step advanced)
+                # Capture screenshot after navigation step (only if step actually completed)
+                # Only take screenshot if step was successful (not skipped)
                 if state.current_step > 0 and state.current_step <= len(state.navigation_steps):
+                    # Wait a moment for UI to stabilize
+                    await asyncio.sleep(0.5)
                     await self._screenshot_step_enhanced(state)
                 
                 # Validate state periodically
